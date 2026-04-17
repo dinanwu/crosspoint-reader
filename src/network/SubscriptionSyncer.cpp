@@ -291,6 +291,7 @@ bool SubscriptionSyncer::fetchAndParseIndex() {
       e.url = entry["url"] | "";
       e.etag = entry["etag"] | "";
       e.size = entry["size"] | 0;
+      e.chapterCount = entry["chapterCount"] | 0;
       if (e.id.empty() || e.url.empty()) {
         LOG_DBG("SUB", "Skipping index entry with missing id or url");
         continue;
@@ -346,6 +347,13 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     progress_.bytesDone = downloaded;
     progress_.bytesTotal = total > 0 ? total : reportedTotal;
 
+    // Give the owning activity a chance to re-render. tick() is blocking inside
+    // HTTPClient::writeToStream, so its loop() never runs — without this hook the
+    // activity has no way to observe progress until the download finishes.
+    if (progressListener_) {
+      progressListener_();
+    }
+
     // The HTTP download blocks the main loop, so service button input here.
     // Without this, the user cannot press Back to cancel, and the Failed/Cancelled
     // screen's Back hint appears unresponsive because gpio.update() isn't running.
@@ -364,7 +372,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     // Keep existing file and state intact; backfill metadata on first sync after
     // the state schema upgrade so the inbox can enumerate pre-existing series.
     if (state_.seriesMeta.find(series.id) == state_.seriesMeta.end() && Storage.exists(destPath.c_str())) {
-      populateSeriesMeta(series.id, series.title, destPath);
+      populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
     }
     return true;
   }
@@ -418,7 +426,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   // Persist the new etag immediately so a crash mid-sync doesn't re-download what we
   // already have.
   state_.seriesEtags[series.id] = result.etag;
-  populateSeriesMeta(series.id, series.title, destPath);
+  populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
   state_.save();
 
   progress_.anyChanges = true;
@@ -427,18 +435,29 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
 }
 
 void SubscriptionSyncer::populateSeriesMeta(const std::string& seriesId, const std::string& title,
-                                            const std::string& epubPath) {
-  Epub epub(epubPath, EPUB_CACHE_DIR);
-  if (!epub.load(true, true)) {
-    LOG_ERR("SUB", "Failed to load epub for metadata: %s", epubPath.c_str());
-    return;
-  }
+                                            const std::string& epubPath, uint16_t chapterCount) {
   SubscriptionState::SeriesMeta m;
   m.title = title;
   m.localPath = epubPath;
   // time(nullptr) returns unix seconds once NTP has synced earlier in this run.
   m.lastSyncedMs = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
-  m.lastKnownSpineCount = static_cast<uint16_t>(epub.getSpineItemsCount());
+
+  if (chapterCount > 0) {
+    // Fast path: the server's index already told us the spine count, so we can
+    // skip the full Epub::load (~18s for a 2MB book on ESP32-C3). The server is
+    // the source of truth for subscription contents per docs/subscription-sync.md.
+    m.lastKnownSpineCount = chapterCount;
+  } else {
+    // Fallback for older servers that don't send chapterCount: parse the EPUB.
+    // Keeps the inbox "N new chapters" badge working at the cost of a long stall.
+    Epub epub(epubPath, EPUB_CACHE_DIR);
+    if (!epub.load(true, true)) {
+      LOG_ERR("SUB", "Failed to load epub for metadata: %s", epubPath.c_str());
+      return;
+    }
+    m.lastKnownSpineCount = static_cast<uint16_t>(epub.getSpineItemsCount());
+  }
+
   state_.seriesMeta[seriesId] = std::move(m);
 }
 

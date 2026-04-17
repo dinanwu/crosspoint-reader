@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,13 @@ class SubscriptionSyncer {
   // should not run; the activity should simply finish() in that case.
   bool begin();
 
+  // Fires whenever progress_ has been updated during a blocking per-series download.
+  // The owning activity uses this to request a re-render while tick() is stuck
+  // inside HTTPClient::writeToStream — without it the progress bar is frozen on
+  // whatever state was visible when the download started.
+  using ProgressListener = std::function<void()>;
+  void setProgressListener(ProgressListener listener) { progressListener_ = std::move(listener); }
+
   // Advances one step. Safe to call while isTerminal() — no-op.
   void tick();
 
@@ -78,6 +86,7 @@ class SubscriptionSyncer {
     std::string url;
     std::string etag;
     size_t size = 0;
+    uint16_t chapterCount = 0;
   };
 
   void transitionTo(Phase p);
@@ -88,7 +97,11 @@ class SubscriptionSyncer {
   bool downloadCurrentSeries();
   void cleanupOrphans();
   void teardownWifi();
-  void populateSeriesMeta(const std::string& seriesId, const std::string& title, const std::string& epubPath);
+  // Writes SeriesMeta for the given series. When chapterCount > 0 the index already
+  // told us how many spine items the EPUB has, so we can skip Epub::load entirely —
+  // otherwise we fall back to parsing the EPUB (expensive: ~18s for a 2MB file).
+  void populateSeriesMeta(const std::string& seriesId, const std::string& title, const std::string& epubPath,
+                          uint16_t chapterCount);
 
   // Recovers the Epub cache directory that corresponds to an EPUB path, so we can
   // invalidate book.bin (and optionally remove the whole dir on unsubscribe).
@@ -105,4 +118,5 @@ class SubscriptionSyncer {
   bool indexUnchanged_ = false;
   bool abortRequested_ = false;
   std::string newIndexEtag_;
+  ProgressListener progressListener_;
 };

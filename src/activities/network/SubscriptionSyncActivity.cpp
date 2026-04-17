@@ -73,6 +73,23 @@ void SubscriptionSyncActivity::onEnter() {
     WIFI_STORE.loadFromFile();
   }
 
+  // Request a render from inside the blocking per-series download whenever the
+  // percent ticks up. The render task runs on its own FreeRTOS task so it can
+  // pick up these notifications even while the main task is stuck in writeToStream.
+  // Throttling by percent keeps the eink refresh rate sane (≤100 renders per file).
+  // `immediate=true` notifies the render task directly — the default deferred path
+  // only sets a flag that ActivityManager::loop() reads, and loop() won't run again
+  // until the download finishes.
+  syncer.setProgressListener([this] {
+    const auto& prog = syncer.progress();
+    if (prog.phase != SubscriptionSyncer::Phase::DownloadingEpub || prog.bytesTotal == 0) return;
+    const int pct = static_cast<int>((prog.bytesDone * 100) / prog.bytesTotal);
+    if (pct != lastRenderedPercent) {
+      lastRenderedPercent = pct;
+      requestUpdate(true);
+    }
+  });
+
   running = syncer.begin();
   if (!running) {
     // Preconditions not met (disabled, no URL/token, no Wi-Fi creds). Silently exit
@@ -128,8 +145,20 @@ void SubscriptionSyncActivity::loop() {
     return;
   }
 
-  // Terminal state — hold briefly, then dismiss. On Failed we stay until the user
-  // presses Back so they can read the failure reason.
+  // Terminal state.
+  // Cancelled: the user explicitly pressed Back to get out — don't make them sit
+  // through an extra "Cancelled" screen. Pop immediately. (The Back release that
+  // triggered the cancel was consumed by the in-download progress callback, so the
+  // activity's own wasReleased(Back) check at the top of loop() won't fire for it;
+  // without this shortcut the only dismiss path is a second Back press or the
+  // 1200ms auto-timeout, both of which can feel like the screen is stuck.)
+  if (syncer.progress().phase == SubscriptionSyncer::Phase::Cancelled) {
+    finish();
+    return;
+  }
+
+  // Done: brief confirmation before dismiss. Failed: stay until the user presses
+  // Back so they can read the failure reason.
   if (terminalEnteredAt == 0) {
     terminalEnteredAt = millis();
     requestUpdate();
@@ -174,7 +203,13 @@ void SubscriptionSyncActivity::render(RenderLock&&) {
 
     if (prog.phase == Phase::DownloadingEpub) {
       if (!prog.currentTitle.empty()) {
-        renderer.drawCenteredText(UI_10_FONT_ID, y, prog.currentTitle.c_str(), true, EpdFontFamily::BOLD);
+        // Title comes from the server's index.json and can be arbitrarily long.
+        // drawCenteredText computes x = (screenWidth - textWidth) / 2, so an over-wide
+        // title drives x negative and every glyph logs "Outside range". Truncate first.
+        const int maxTitleWidth = pageWidth - metrics.contentSidePadding * 2;
+        const std::string truncated =
+            renderer.truncatedText(UI_10_FONT_ID, prog.currentTitle.c_str(), maxTitleWidth, EpdFontFamily::BOLD);
+        renderer.drawCenteredText(UI_10_FONT_ID, y, truncated.c_str(), true, EpdFontFamily::BOLD);
         y += lineHeight + metrics.verticalSpacing;
       }
 
