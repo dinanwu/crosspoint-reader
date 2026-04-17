@@ -364,6 +364,9 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
 
   const int64_t reportedLength = http.getSize();
   const size_t contentLength = reportedLength > 0 ? static_cast<size_t>(reportedLength) : 0;
+  LOG_INF("HTTP", "Begin download: %zu bytes -> %s (free=%u minFree=%u maxAlloc=%u)", contentLength, destPath.c_str(),
+          static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
 
   if (Storage.exists(destPath.c_str())) {
     Storage.remove(destPath.c_str());
@@ -377,14 +380,21 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
     return result;
   }
 
+  const unsigned long downloadStartMs = millis();
   FileWriteStream fileStream(file, contentLength, progress);
   const int writeResult = http.writeToStream(&fileStream);
+  const unsigned long downloadElapsedMs = millis() - downloadStartMs;
 
   file.close();
   http.end();
 
   if (writeResult < 0 || !fileStream.ok()) {
-    LOG_ERR("HTTP", "Stream write failed: %d", writeResult);
+    LOG_ERR("HTTP",
+            "Stream write failed: writeResult=%d (%s) streamOk=%d aborted=%d "
+            "downloaded=%zu/%zu elapsed=%lums (free=%u maxAlloc=%u)",
+            writeResult, httpErrorName(writeResult), fileStream.ok() ? 1 : 0, fileStream.aborted() ? 1 : 0,
+            fileStream.downloaded(), contentLength, downloadElapsedMs, static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
     Storage.remove(destPath.c_str());
     result.status = -1;
     return result;
@@ -392,11 +402,14 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
 
   const size_t downloaded = fileStream.downloaded();
   if (contentLength > 0 && downloaded != contentLength) {
-    LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu", downloaded, contentLength);
+    LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu (elapsed=%lums)", downloaded, contentLength,
+            downloadElapsedMs);
     Storage.remove(destPath.c_str());
     result.status = -1;
     return result;
   }
 
+  LOG_INF("HTTP", "Download complete: %zu bytes in %lums (free=%u)", downloaded, downloadElapsedMs,
+          static_cast<unsigned>(ESP.getFreeHeap()));
   return result;
 }

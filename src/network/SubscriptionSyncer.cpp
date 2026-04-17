@@ -339,6 +339,9 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   // to date. Empty string means "we don't have this series locally yet".
   const std::string ifNoneMatch = (it != state_.seriesEtags.end()) ? it->second : std::string();
 
+  LOG_INF("SUB", "Downloading series '%s' (%zu bytes expected) url=%s ifNoneMatch=%s", series.id.c_str(), series.size,
+          url.c_str(), ifNoneMatch.empty() ? "<none>" : ifNoneMatch.c_str());
+
   auto progressCb = [this, total = series.size](size_t downloaded, size_t reportedTotal) -> bool {
     progress_.bytesDone = downloaded;
     progress_.bytesTotal = total > 0 ? total : reportedTotal;
