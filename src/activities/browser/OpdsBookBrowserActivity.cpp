@@ -265,6 +265,7 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
         downloadProgress = downloaded;
         downloadTotal = total;
         requestUpdate(true);
+        return true;
       });
 
   if (result == HttpDownloader::OK) {

@@ -28,6 +28,21 @@ class EpubReaderActivity final : public Activity {
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
 
+  // Subscription break page (shown once on the first render at or past the watermark
+  // spine index — i.e. when the user pages into chapters added since they last opened
+  // the book). Detected by the presence of sub_watermark.bin next to progress.bin.
+  bool isSubscription = false;
+  uint16_t watermarkSpineCount = 0;
+  bool breakPageDismissed = false;
+
+  bool shouldShowBreakPage() const;
+  void renderBreakPage();
+
+  // End-of-book hand-off: if this is a subscription EPUB, transitions to the
+  // most-recently-synced other subscription that still has unread chapters.
+  // Returns true if a transition was kicked off (caller should not call onGoHome).
+  bool tryAutoAdvanceToNextSubscription();
+
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   struct SavedPosition {

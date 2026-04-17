@@ -13,27 +13,17 @@ Mission: Provide a lightweight, high-performance reading experience focused on E
 * Verification: After suggesting a fix, instruct the user on how to verify it (e.g., monitoring heap via Serial or checking a specific cache file).
 ---
 
-## Development Environment Awareness
+## Repository Layout Notes
 
-**CRITICAL**: Detect the host platform at session start to choose appropriate tools and commands.
-
-### Platform Detection
-```bash
-# Detect platform (run once per session)
-uname -s
-# Returns: MINGW64_NT-* (Windows Git Bash), Linux, Darwin (macOS)
-```
-
-**Detection Required**: Run `uname -s` at session start to determine platform
-
-### Platform-Specific Behaviors
-- **Windows (Git Bash)**: Unix commands, `C:\` paths in Windows but `/` in bash, limited glob (use `find`+`xargs`)
-- **Linux/WSL**: Full bash, Unix paths, native glob support
-
-**Cross-Platform Code Formatting**:
-```bash
-find src -name "*.cpp" -o -name "*.h" | xargs clang-format -i
-```
+- `CLAUDE.md` is a **symlink** to `.skills/SKILL.md`. Edit the target file, not the symlink.
+- `open-x4-sdk/` is a **git submodule** (`.gitmodules` → `open-x4-epaper/community-sdk`). A fresh clone needs `git clone --recursive` or `git submodule update --init --recursive`, otherwise the directory is empty and the build fails on missing `lib_deps` symlinks.
+- Repo supports Windows (Git Bash), Linux/WSL, and macOS. On Windows, prefer `find … | xargs` over shell globs.
+- Top-level docs that complement this guide:
+  - [README.md](../README.md) — installation, motivation, feature list
+  - [SCOPE.md](../SCOPE.md) — what's in/out of scope (read before proposing new features)
+  - [GOVERNANCE.md](../GOVERNANCE.md) — decision process and maintainership
+  - [docs/contributing/](../docs/contributing/) — `architecture.md`, `getting-started.md`, `development-workflow.md`, `testing-debugging.md` (authoritative; prefer these over restated detail in this file)
+  - [docs/file-formats.md](../docs/file-formats.md) — cache binary formats and version numbers
 
 ---
 
@@ -85,25 +75,34 @@ find src -name "*.cpp" -o -name "*.h" | xargs clang-format -i
 * `partitions.csv`: ESP32 flash partition layout
 
 ### Build Environment
-* **Standard**: C++20 (`-std=c++2a`). No Exceptions, No RTTI.
+* **Standard**: C++20 (`-std=gnu++2a`). No Exceptions (`-fno-exceptions`), No RTTI.
 * **Logging**: ALWAYS use `LOG_INF`, `LOG_DBG`, or `LOG_ERR` from `Logging.h`. Raw Serial output is deprecated.
 * **Environments** (in `platformio.ini`):
-  * `default`: Development (LOG_LEVEL=2, serial enabled)
-  * `gh_release`: Production (LOG_LEVEL=0)
-  * `gh_release_rc`: Release candidate (LOG_LEVEL=1)
-  * `slim`: Minimal build (no serial logging)
+  * `default`: Development (`LOG_LEVEL=2`, serial enabled)
+  * `gh_release`: Production (`LOG_LEVEL=1`, serial enabled)
+  * `gh_release_rc`: Release candidate (`LOG_LEVEL=1`, version tagged with `${CROSSPOINT_RC_HASH}`)
+  * `slim`: Minimal build (`-UENABLE_SERIAL_LOG`, no serial output)
+* **Pre-build scripts** (`extra_scripts` in `platformio.ini`, run on every build):
+  * `scripts/build_html.py` — bundles `data/html/*.html` into `*.generated.h`
+  * `scripts/gen_i18n.py` — generates `lib/I18n/I18nKeys.h`/`I18nStrings.{h,cpp}` from YAML
+  * `scripts/git_branch.py` — injects `CROSSPOINT_VERSION` (includes branch name on `default`)
+  * `scripts/patch_jpegdec.py` — patches the JPEGDEC dependency
 
 ### Critical Build Flags
 These flags in `platformio.ini` fundamentally affect firmware behavior:
 
 ```cpp
--DEINK_DISPLAY_SINGLE_BUFFER_MODE=1  // Single framebuffer (saves 48KB RAM!)
--DARDUINO_USB_MODE=1                 // Enable USB CDC
--DARDUINO_USB_CDC_ON_BOOT=1          // Serial available immediately at boot
--DXML_CONTEXT_BYTES=1024             // XML parser memory limit (EPUB parsing)
--DUSE_UTF8_LONG_NAMES=1              // SD card long filename support
--DMINIZ_NO_ZLIB_COMPATIBLE_NAMES=1   // Avoid zlib name conflicts
--DXML_GE=0                           // Disable XML general entities (security)
+-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1     // Single framebuffer (saves 48KB RAM!)
+-DARDUINO_USB_MODE=1                    // Enable USB CDC
+-DARDUINO_USB_CDC_ON_BOOT=1             // Serial available immediately at boot
+-DXML_CONTEXT_BYTES=1024                // expat parser memory limit (EPUB parsing)
+-DXML_GE=0                              // Disable XML general entities (security)
+-DUSE_UTF8_LONG_NAMES=1                 // SD card long filename support (SdFat)
+-DDISABLE_FS_H_WARNING=1                // Suppress FS.h vs SdFat conflict warning
+-DDESTRUCTOR_CLOSES_FILE=1              // SdFat: auto-close file on FsFile destruction
+-DPNG_MAX_BUFFERED_PIXELS=16416         // PNGdec scanline buffer for ≤2048px-wide images
+-fno-exceptions                         // No C++ exceptions (smaller binary, no unwind tables)
+-Wl,--wrap=panic_print_backtrace,--wrap=panic_abort  // Hooks for custom crash dump output
 ```
 
 **SINGLE_BUFFER_MODE implications**:
@@ -482,12 +481,24 @@ pio run -t upload && pio device monitor
 # Static analysis (cppcheck)
 pio check
 
-# Format code (clang-format) - Windows Git Bash
-find src -name "*.cpp" -o -name "*.h" | xargs clang-format -i
+# Format code — preferred: repo's wrapper. Requires clang-format 21+ (enforced).
+./bin/clang-format-fix         # All tracked C/C++ files (excludes generated font/hyphenation/uzlib)
+./bin/clang-format-fix -g      # Only modified files (git --modified)
+# Windows: bin/clang-format-fix.ps1
 
-# Format code (clang-format) - Linux
-clang-format -i src/**/*.cpp src/**/*.h
+# Raw fallback if the wrapper is unavailable:
+find src -name "*.cpp" -o -name "*.h" | xargs clang-format -i
 ```
+
+### Host-Side Tests (`test/`)
+
+Not PlatformIO unit tests — these are host-side evaluation scripts run from a workstation:
+
+* `test/differential_rounding/` + `test/run_differential_rounding_test.sh` — regression harness for font rendering rounding
+* `test/hyphenation_eval/` + `test/run_hyphenation_eval.sh` — hyphenation correctness eval
+* `test/epubs/` — sample EPUBs used as fixtures
+
+Run these manually when touching rendering or hyphenation code. There is no automated test suite for firmware behavior; hardware verification is the final check.
 
 ### Debugging Crashes
 
@@ -532,119 +543,24 @@ clang-format -i src/**/*.cpp src/**/*.h
 
 ---
 
-## Git Workflow and Repository Awareness
+## Git Workflow
 
-### Repository Detection Protocol
+Run `git remote -v` once per session — contributors may have either a direct clone (`origin` = upstream) or a fork (`origin` = personal, `upstream` = main repo). Default branch is `master` (not `main`). Confirm push target with the user before pushing.
 
-**CRITICAL**: ALWAYS verify repository context before git operations. This could be:
-- A **fork** with `origin` pointing to personal repo, `upstream` to main repo
-- A **direct clone** with `origin` pointing to main repo
-- Multiple collaborator remotes
+### Branch and commit conventions
 
-**Verification Commands** (run at session start):
-```bash
-# Check current branch
-git branch --show-current
+Branch names: `feature/<desc>`, `fix/<issue>-<desc>`, `refactor/<component>`, `docs/<topic>`.
 
-# Check all remotes
-git remote -v
+Commit format follows Conventional Commits: `<type>: <summary>` where type is one of `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`. The CI format check enforces this on PR titles.
 
-# Identify main branch name (could be 'main' or 'master')
-git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@'
+### Staging hazards specific to this repo
 
-# Check working tree status
-git status --short
-```
+Generated files are gitignored but easy to stage by accident if you `git add -A`. Always verify with `git status` before committing — never stage:
+- `*.generated.h` (HTML headers, regenerated by `scripts/build_html.py`)
+- `lib/I18n/I18nKeys.h`, `lib/I18n/I18nStrings.{h,cpp}` (regenerated by `scripts/gen_i18n.py`)
+- `.pio/`, `compile_commands.json`, `platformio.local.ini`
 
-**Example Output** (forked repository):
-```text
-origin      https://github.com/<your-username>/crosspoint-reader.git (fetch/push)
-upstream    https://github.com/crosspoint-reader/crosspoint-reader.git (fetch/push)
-```
-
-### Git Operation Rules
-
-1. **Never assume branch names**:
-   ```bash
-   # Bad: git push origin main
-   # Good: git push origin $(git branch --show-current)
-   ```
-
-2. **Never assume remote names or write permissions**:
-   - **Forked repos**: Push to `origin` (your fork), submit PR to `upstream`
-   - **Direct contributors**: May push feature branches to `upstream`
-   - **Always ask**: "Should I push to origin or create a PR?"
-
-3. **Check for upstream changes before starting work**:
-   ```bash
-   # Sync fork with upstream (if applicable)
-   git fetch upstream
-   git merge upstream/main  # or upstream/master
-   ```
-
-4. **Use explicit remote and branch names**:
-   ```bash
-   # Check remotes first
-   git remote -v
-
-   # Use explicit syntax
-   git push <remote> <branch>
-   ```
-
-### Branch Naming Convention
-
-**For feature/fix branches**:
-```text
-feature/<short-description>       # New features
-fix/<issue-number>-<description>  # Bug fixes
-refactor/<component-name>         # Code refactoring
-docs/<topic>                      # Documentation updates
-```
-
-**Examples**:
-- `feature/sd-download-progress`
-- `fix/123-orientation-crash`
-- `refactor/hal-storage`
-
-### Commit Message Format
-
-**Pattern**:
-```text
-<type>: <short summary (50 chars max)>
-
-<optional detailed description>
-
-```
-
-**Types**: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`
-
-**Example**:
-```text
-feat: add real-time SD download progress bar
-
-Implements progress tracking for book downloads using
-UITheme progress bar component with heap-safe updates.
-
-Tested in all 4 orientations with 5MB+ files.
-```
-
-### When to Commit
-
-**DO commit when**:
-- User explicitly requests: "commit these changes"
-- Feature is complete and tested on device
-- Bug fix is verified working
-- Refactoring preserves all functionality
-- All tests pass (`pio run` succeeds)
-
-**DO NOT commit when**:
-- Changes are untested on actual hardware
-- Build fails or has warnings
-- Experimenting or debugging in progress
-- User hasn't explicitly requested commit
-- Files excluded by `.gitignore` would be included — always run `git status` and cross-check against `.gitignore` before staging (e.g., `*.generated.h`, `.pio/`, `compile_commands.json`, `platformio.local.ini`)
-
-**Rule**: **If uncertain, ASK before committing.**
+Only commit when explicitly asked or when work is verified on hardware. If uncertain, ask.
 
 ---
 

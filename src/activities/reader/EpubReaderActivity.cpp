@@ -23,6 +23,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/SubscriptionState.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -70,6 +71,22 @@ void EpubReaderActivity::onEnter() {
       cachedChapterTotalPageCount = data[4] + (data[5] << 8);
     }
   }
+
+  // Detect subscription + read watermark. Presence of sub_watermark.bin marks this
+  // EPUB as a subscription series; the uint16_t value is the spine count at the last
+  // onExit (i.e. what the user has seen).
+  {
+    FsFile wf;
+    if (Storage.openFileForRead("ERS", epub->getCachePath() + "/sub_watermark.bin", wf)) {
+      uint8_t buf[2];
+      if (wf.read(buf, 2) == 2) {
+        isSubscription = true;
+        watermarkSpineCount = buf[0] + (buf[1] << 8);
+        LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
+                epub->getSpineItemsCount());
+      }
+    }
+  }
   // We may want a better condition to detect if we are opening for the first time.
   // This will trigger if the book is re-opened at Chapter 0.
   if (currentSpineIndex == 0) {
@@ -95,10 +112,51 @@ void EpubReaderActivity::onExit() {
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
+  // Re-arm the subscription watermark: record the current spine count so the next
+  // sync-added chapters will trigger the break page again. Write only for books that
+  // already carry the sidecar (i.e. those the syncer seeded).
+  if (isSubscription && epub) {
+    const uint16_t spineCount = static_cast<uint16_t>(epub->getSpineItemsCount());
+    FsFile wf;
+    if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/sub_watermark.bin", wf)) {
+      const uint8_t buf[2] = {static_cast<uint8_t>(spineCount & 0xff), static_cast<uint8_t>((spineCount >> 8) & 0xff)};
+      wf.write(buf, 2);
+      wf.close();
+    }
+  }
+
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
   section.reset();
   epub.reset();
+}
+
+bool EpubReaderActivity::shouldShowBreakPage() const {
+  if (!isSubscription || breakPageDismissed || !epub) return false;
+  const int spineCount = epub->getSpineItemsCount();
+  // Only show while there's something new to flag and we've actually reached it.
+  return watermarkSpineCount < spineCount && currentSpineIndex >= watermarkSpineCount && currentSpineIndex < spineCount;
+}
+
+void EpubReaderActivity::renderBreakPage() {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const auto lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
+
+  renderer.clearScreen();
+
+  const int centerY = pageHeight / 2;
+  renderer.drawCenteredText(UI_12_FONT_ID, centerY - lineHeight, tr(STR_NEW_CHAPTERS_HEADER), true,
+                            EpdFontFamily::BOLD);
+
+  char msg[64];
+  const int newCount = epub ? epub->getSpineItemsCount() - watermarkSpineCount : 0;
+  snprintf(msg, sizeof(msg), tr(STR_NEW_CHAPTERS_COUNT), newCount);
+  renderer.drawCenteredText(UI_12_FONT_ID, centerY + metrics.verticalSpacing, msg);
+
+  renderer.displayBuffer();
+  (void)pageWidth;  // reserved for future layout tweaks
 }
 
 void EpubReaderActivity::loop() {
@@ -180,10 +238,13 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // At end of the book, forward button goes home and back button returns to last page
+  // At end of the book, forward button goes home (or hops to the next unread
+  // subscription, if this book is one) and back button returns to last page.
   if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
     if (nextTriggered) {
-      onGoHome();
+      if (!tryAutoAdvanceToNextSubscription()) {
+        onGoHome();
+      }
     } else {
       currentSpineIndex = epub->getSpineItemsCount() - 1;
       nextPageNumber = UINT16_MAX;
@@ -465,6 +526,16 @@ void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
+  // If the break page is currently displayed, a forward press dismisses it and falls
+  // through to the normal chapter content; a backward press returns to the last page
+  // of the previous chapter (normal behaviour).
+  if (isForwardTurn && shouldShowBreakPage()) {
+    breakPageDismissed = true;
+    lastPageTurnTime = millis();
+    requestUpdate();
+    return;
+  }
+
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
@@ -514,6 +585,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
+    automaticPageTurnActive = false;
+    return;
+  }
+
+  // Subscription break page: shown once when the user first pages into content added
+  // since last open. Dismissed by a forward page turn (handled in pageTurn()).
+  if (shouldShowBreakPage()) {
+    renderBreakPage();
     automaticPageTurnActive = false;
     return;
   }
@@ -879,6 +958,33 @@ void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool s
   }
   requestUpdate();
   LOG_DBG("ERS", "Navigated to spine %d for href: %s", targetSpineIndex, hrefStr.c_str());
+}
+
+bool EpubReaderActivity::tryAutoAdvanceToNextSubscription() {
+  if (!isSubscription || !epub) return false;
+
+  SubscriptionState state;
+  if (!state.load()) return false;
+
+  // Resolve current series id by matching the on-disk path against stored metadata.
+  std::string currentId;
+  const std::string& path = epub->getPath();
+  for (const auto& kv : state.seriesMeta) {
+    if (kv.second.localPath == path) {
+      currentId = kv.first;
+      break;
+    }
+  }
+
+  const auto candidates = state.unreadSeriesIds(currentId);
+  if (candidates.empty()) return false;
+
+  auto it = state.seriesMeta.find(candidates.front());
+  if (it == state.seriesMeta.end() || it->second.localPath.empty()) return false;
+
+  LOG_DBG("ERS", "Auto-advancing to next subscription: %s", it->second.localPath.c_str());
+  activityManager.goToReader(it->second.localPath);
+  return true;
 }
 
 void EpubReaderActivity::restoreSavedPosition() {

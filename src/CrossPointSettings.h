@@ -199,6 +199,10 @@ class CrossPointSettings {
   uint8_t showHiddenFiles = 0;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
+  // Subscription sync (web serial auto-download)
+  uint8_t subscriptionsEnabled = 0;
+  char subscriptionServerUrl[256] = "";
+  char subscriptionBearerToken[128] = "";
 
   ~CrossPointSettings() = default;
 

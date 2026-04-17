@@ -120,6 +120,14 @@ inline const std::vector<SettingInfo>& getSettingsList() {
       SettingInfo::String(StrId::STR_PASSWORD, SETTINGS.opdsPassword, sizeof(SETTINGS.opdsPassword), "opdsPassword",
                           StrId::STR_OPDS_BROWSER)
           .withObfuscated(),
+      // --- Subscriptions (web serial auto-sync) ---
+      SettingInfo::Toggle(StrId::STR_SUBSCRIPTIONS_ENABLED, &CrossPointSettings::subscriptionsEnabled,
+                          "subscriptionsEnabled", StrId::STR_SUBSCRIPTIONS),
+      SettingInfo::String(StrId::STR_SUBSCRIPTION_SERVER_URL, SETTINGS.subscriptionServerUrl,
+                          sizeof(SETTINGS.subscriptionServerUrl), "subscriptionServerUrl", StrId::STR_SUBSCRIPTIONS),
+      SettingInfo::String(StrId::STR_SUBSCRIPTION_BEARER_TOKEN, SETTINGS.subscriptionBearerToken,
+                          sizeof(SETTINGS.subscriptionBearerToken), "subscriptionBearerToken", StrId::STR_SUBSCRIPTIONS)
+          .withObfuscated(),
       // --- Status Bar Settings (web-only, uses StatusBarSettingsActivity) ---
       SettingInfo::Toggle(StrId::STR_CHAPTER_PAGE_COUNT, &CrossPointSettings::statusBarChapterPageCount,
                           "statusBarChapterPageCount", StrId::STR_CUSTOMISE_STATUS_BAR),

@@ -16,11 +16,12 @@
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
+#include "SubscriptionsInboxActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
 int HomeActivity::getMenuItemCount() const {
-  int count = 4;  // File Browser, Recents, File transfer, Settings
+  int count = 5;  // File Browser, Recents, Subscriptions, File transfer, Settings
   if (!recentBooks.empty()) {
     count += recentBooks.size();
   }
@@ -191,6 +192,7 @@ void HomeActivity::loop() {
     const int fileBrowserIdx = idx++;
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsUrl ? idx++ : -1;
+    const int subscriptionsIdx = idx++;
     const int fileTransferIdx = idx++;
     const int settingsIdx = idx;
 
@@ -202,6 +204,8 @@ void HomeActivity::loop() {
       onRecentsOpen();
     } else if (menuSelectedIndex == opdsLibraryIdx) {
       onOpdsBrowserOpen();
+    } else if (menuSelectedIndex == subscriptionsIdx) {
+      onSubscriptionsInboxOpen();
     } else if (menuSelectedIndex == fileTransferIdx) {
       onFileTransferOpen();
     } else if (menuSelectedIndex == settingsIdx) {
@@ -229,11 +233,15 @@ void HomeActivity::render(RenderLock&&) {
                                         tr(STR_SETTINGS_TITLE)};
   std::vector<UIIcon> menuIcons = {Folder, Recent, Transfer, Settings};
 
+  int insertPos = 2;
   if (hasOpdsUrl) {
-    // Insert OPDS Browser after File Browser
-    menuItems.insert(menuItems.begin() + 2, tr(STR_OPDS_BROWSER));
-    menuIcons.insert(menuIcons.begin() + 2, Library);
+    menuItems.insert(menuItems.begin() + insertPos, tr(STR_OPDS_BROWSER));
+    menuIcons.insert(menuIcons.begin() + insertPos, Library);
+    insertPos++;
   }
+  menuItems.insert(menuItems.begin() + insertPos, tr(STR_SUBSCRIPTIONS));
+  menuIcons.insert(menuIcons.begin() + insertPos, Library);
+  insertPos++;
 
   GUI.drawButtonMenu(
       renderer,
@@ -269,3 +277,7 @@ void HomeActivity::onSettingsOpen() { activityManager.goToSettings(); }
 void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
 
 void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
+
+void HomeActivity::onSubscriptionsInboxOpen() {
+  activityManager.replaceActivity(std::make_unique<SubscriptionsInboxActivity>(renderer, mappedInput));
+}

@@ -107,4 +107,5 @@ class CrossPointWebServer {
   void handleSettingsPage() const;
   void handleGetSettings() const;
   void handlePostSettings();
+  void handleSubscriptionsTest() const;
 };

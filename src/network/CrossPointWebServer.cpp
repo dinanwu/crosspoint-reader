@@ -11,7 +11,9 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "HttpDownloader.h"
 #include "SettingsList.h"
+#include "SubscriptionSyncer.h"
 #include "WebDAVHandler.h"
 #include "html/FilesPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
@@ -159,6 +161,7 @@ void CrossPointWebServer::begin() {
   server->on("/settings", HTTP_GET, [this] { handleSettingsPage(); });
   server->on("/api/settings", HTTP_GET, [this] { handleGetSettings(); });
   server->on("/api/settings", HTTP_POST, [this] { handlePostSettings(); });
+  server->on("/api/subscriptions/test", HTTP_POST, [this] { handleSubscriptionsTest(); });
 
   server->onNotFound([this] { handleNotFound(); });
   LOG_DBG("WEB", "[MEM] Free heap after route setup: %d bytes", ESP.getFreeHeap());
@@ -1139,10 +1142,22 @@ void CrossPointWebServer::handleGetSettings() const {
       }
       case SettingType::STRING: {
         doc["type"] = "string";
+        bool hasValue = false;
         if (s.stringGetter) {
-          doc["value"] = s.stringGetter();
+          const std::string current = s.stringGetter();
+          hasValue = !current.empty();
+          if (!s.obfuscated) doc["value"] = current;
         } else if (s.stringMaxLen > 0) {
-          doc["value"] = reinterpret_cast<const char*>(&SETTINGS) + s.stringOffset;
+          const char* current = reinterpret_cast<const char*>(&SETTINGS) + s.stringOffset;
+          hasValue = current[0] != '\0';
+          if (!s.obfuscated) doc["value"] = current;
+        }
+        if (s.obfuscated) {
+          // Never echo secrets back over the wire. The UI uses hasValue to pick a placeholder
+          // and empty-POST to mean "keep existing".
+          doc["value"] = "";
+          doc["obfuscated"] = true;
+          doc["hasValue"] = hasValue;
         }
         break;
       }
@@ -1223,6 +1238,11 @@ void CrossPointWebServer::handlePostSettings() {
       }
       case SettingType::STRING: {
         const std::string val = doc[s.key].as<std::string>();
+        // Obfuscated fields use empty-POST to mean "keep existing value" — the UI never
+        // receives the current secret, so blank Save must not clobber it.
+        if (s.obfuscated && val.empty()) {
+          break;
+        }
         if (s.stringSetter) {
           s.stringSetter(val);
         } else if (s.stringMaxLen > 0) {
@@ -1242,6 +1262,65 @@ void CrossPointWebServer::handlePostSettings() {
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");
+}
+
+void CrossPointWebServer::handleSubscriptionsTest() const {
+  if (!server->hasArg("plain")) {
+    server->send(400, "application/json", R"({"ok":false,"message":"Missing JSON body"})");
+    return;
+  }
+
+  JsonDocument req;
+  if (deserializeJson(req, server->arg("plain"))) {
+    server->send(400, "application/json", R"({"ok":false,"message":"Invalid JSON"})");
+    return;
+  }
+
+  // Empty field falls back to the saved value so the user can test on a fresh page
+  // load without re-typing the obfuscated token (GET never returned it).
+  std::string url = (req["url"] | "");
+  std::string token = (req["token"] | "");
+  if (url.empty()) url = SETTINGS.subscriptionServerUrl;
+  if (token.empty()) token = SETTINGS.subscriptionBearerToken;
+  if (url.empty() || token.empty()) {
+    server->send(400, "application/json", R"({"ok":false,"message":"Enter a URL and token"})");
+    return;
+  }
+
+  url = SubscriptionSyncer::normalizeServerUrl(url);
+  const std::string fullUrl = url + "/v1/subs/index.json";
+
+  std::string body;
+  const auto result = HttpDownloader::fetchConditional(fullUrl, body, token, "");
+
+  JsonDocument resp;
+  resp["status"] = result.status;
+  if (result.status == 200) {
+    JsonDocument index;
+    if (deserializeJson(index, body)) {
+      resp["ok"] = false;
+      resp["message"] = "Server returned invalid JSON";
+    } else {
+      JsonArrayConst series = index["series"];
+      resp["ok"] = true;
+      resp["seriesCount"] = series.isNull() ? 0 : static_cast<int>(series.size());
+    }
+  } else if (result.status == 401) {
+    resp["ok"] = false;
+    resp["message"] = "Unauthorized (bad token)";
+  } else if (result.status > 0) {
+    resp["ok"] = false;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "HTTP %d", result.status);
+    resp["message"] = msg;
+  } else {
+    resp["ok"] = false;
+    resp["message"] = "Network error (check URL / Wi-Fi)";
+  }
+
+  String out;
+  serializeJson(resp, out);
+  server->send(200, "application/json", out);
 }
 
 // WebSocket callback trampoline

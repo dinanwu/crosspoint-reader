@@ -22,6 +22,7 @@
 #include "RecentBooksStore.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/network/SubscriptionSyncActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ButtonNavigator.h"
@@ -304,6 +305,15 @@ void setup() {
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();
     activityManager.goToReader(path);
+  }
+
+  // On power-button wakes, push the subscription sync activity on top of whatever
+  // home/reader dispatch just picked. The activity silently finishes if subscriptions
+  // aren't enabled / configured, or if no Wi-Fi credentials are saved.
+  if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !HalSystem::isRebootFromPanic() &&
+      SETTINGS.subscriptionsEnabled && strlen(SETTINGS.subscriptionServerUrl) > 0 &&
+      strlen(SETTINGS.subscriptionBearerToken) > 0) {
+    activityManager.pushActivity(std::make_unique<SubscriptionSyncActivity>(renderer, mappedInputManager));
   }
 
   // Ensure we're not still holding the power button before leaving setup

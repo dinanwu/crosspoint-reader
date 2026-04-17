@@ -207,6 +207,29 @@
       from { transform: rotate(0deg); }
       to { transform: rotate(360deg); }
     }
+    .help {
+      color: var(--label-color);
+      font-size: 0.9em;
+      margin: 0 0 12px 0;
+    }
+    .test-btn {
+      background-color: var(--accent-color);
+      color: white;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.95em;
+    }
+    .test-btn:hover { background-color: var(--accent-hover-color); }
+    .test-btn:disabled { background-color: #95a5a6; cursor: not-allowed; }
+    .test-result {
+      margin-top: 10px;
+      font-size: 0.95em;
+      min-height: 1.2em;
+    }
+    .test-result.ok { color: #27ae60; }
+    .test-result.err { color: #e74c3c; }
     @media (max-width: 600px) {
       body {
         padding: 10px;
@@ -311,9 +334,19 @@
     }
 
     if (setting.type === 'string') {
-      const inputType = setting.name.toLowerCase().includes('password') ? 'password' : 'text';
-      const val = setting.value || '';
+      const isSecret = setting.obfuscated === true ||
+        setting.name.toLowerCase().includes('password');
+      const inputType = isSecret ? 'password' : 'text';
+      // Obfuscated values are never echoed back — start empty, use placeholder to signal state.
+      const val = setting.obfuscated ? '' : (setting.value || '');
+      let placeholder = '';
+      if (setting.obfuscated) {
+        placeholder = setting.hasValue ? 'Leave blank to keep current' : 'Not set';
+      } else if (setting.key === 'subscriptionServerUrl') {
+        placeholder = 'https://example.com';
+      }
       return '<input type="' + inputType + '" id="' + id + '" value="' + escapeHtml(val) + '"' +
+        ' placeholder="' + escapeHtml(placeholder) + '"' +
         ' oninput="markChanged()">';
     }
 
@@ -369,12 +402,23 @@
 
       for (const category in groups) {
         html += '<div class="card"><h2>' + escapeHtml(category) + '</h2>';
+        if (category === 'Subscriptions') {
+          html += '<p class="help">Auto-syncs web serials from your own server on each power-on. ' +
+            'Enter your server\'s base URL only — the device appends <code>/v1/subs/index.json</code>. ' +
+            'Use Test Connection below to verify.</p>';
+        }
         groups[category].forEach(function(s) {
           html += '<div class="setting-row">' +
             '<span class="setting-name">' + escapeHtml(s.name) + '</span>' +
             '<span class="setting-control">' + renderControl(s) + '</span>' +
             '</div>';
         });
+        if (category === 'Subscriptions') {
+          html += '<div style="margin-top:14px;">' +
+            '<button type="button" class="test-btn" id="testSubsBtn" onclick="testSubscriptions()">Test Connection</button>' +
+            '<div id="testSubsResult" class="test-result"></div>' +
+            '</div>';
+        }
         html += '</div>';
       }
 
@@ -432,6 +476,41 @@
     }
 
     btn.textContent = 'Save Settings';
+  }
+
+  async function testSubscriptions() {
+    const btn = document.getElementById('testSubsBtn');
+    const out = document.getElementById('testSubsResult');
+    const urlEl = document.getElementById('setting-subscriptionServerUrl');
+    const tokenEl = document.getElementById('setting-subscriptionBearerToken');
+
+    btn.disabled = true;
+    out.className = 'test-result';
+    out.textContent = 'Testing…';
+
+    try {
+      const response = await fetch('/api/subscriptions/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: urlEl ? urlEl.value : '',
+          token: tokenEl ? tokenEl.value : ''
+        })
+      });
+      const data = await response.json();
+      if (data.ok) {
+        out.className = 'test-result ok';
+        out.textContent = 'Connected — ' + data.seriesCount + ' series available';
+      } else {
+        out.className = 'test-result err';
+        out.textContent = data.message || ('HTTP ' + data.status);
+      }
+    } catch (e) {
+      out.className = 'test-result err';
+      out.textContent = 'Request failed: ' + e.message;
+    }
+
+    btn.disabled = false;
   }
 
   loadSettings();
