@@ -118,23 +118,15 @@ void EpubReaderActivity::onExit() {
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
-  // Re-arm the subscription watermark: record the current spine count so the next
-  // sync-added chapters will trigger the break page again. Write only for books that
-  // already carry the sidecar (i.e. those the syncer seeded).
+  // Re-arm the subscription watermark to the current spine count so the next
+  // sync-added chapters will trigger the break page again.
   if (isSubscription && epub) {
     const uint16_t spineCount = static_cast<uint16_t>(epub->getSpineItemsCount());
-    const std::string watermarkPath = epub->getCachePath() + "/sub_watermark.bin";
-    FsFile wf;
-    if (Storage.openFileForWrite("ERS", watermarkPath, wf)) {
-      const uint8_t buf[2] = {static_cast<uint8_t>(spineCount & 0xff), static_cast<uint8_t>((spineCount >> 8) & 0xff)};
-      wf.write(buf, 2);
-      wf.close();
-      LOG_DBG("ERS", "Watermark rewritten to %u at %s", spineCount, watermarkPath.c_str());
+    if (SubscriptionState::writeWatermark(epub->getPath(), spineCount)) {
+      LOG_DBG("ERS", "Watermark rewritten to %u", spineCount);
     } else {
-      LOG_ERR("ERS", "Failed to open watermark for write at %s", watermarkPath.c_str());
+      LOG_ERR("ERS", "Failed to write watermark for %s", epub->getPath().c_str());
     }
-  } else {
-    LOG_DBG("ERS", "Skipping watermark write: isSubscription=%d, epub=%d", isSubscription ? 1 : 0, epub ? 1 : 0);
   }
 
   APP_STATE.readerActivityLoadCount = 0;
@@ -145,6 +137,12 @@ void EpubReaderActivity::onExit() {
 
 bool EpubReaderActivity::shouldShowBreakPage() const {
   if (!isSubscription || breakPageDismissed || !epub) return false;
+  // Suppress on the very first open: the syncer seeds watermark=0 so the inbox
+  // can mark a freshly-subscribed series as "New", but we don't want to greet
+  // the user with "— N new chapters —" before they've read anything. Subsequent
+  // opens write the watermark to the spine count on exit, so a nonzero value
+  // means "user has read this before; these are truly new chapters."
+  if (watermarkSpineCount == 0) return false;
   const int spineCount = epub->getSpineItemsCount();
   // Only show while there's something new to flag and we've actually reached it.
   return watermarkSpineCount < spineCount && currentSpineIndex >= watermarkSpineCount && currentSpineIndex < spineCount;

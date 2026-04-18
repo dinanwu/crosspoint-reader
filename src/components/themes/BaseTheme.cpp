@@ -13,6 +13,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/SubscriptionSyncService.h"
 
 // Internal constants
 namespace {
@@ -138,6 +139,20 @@ void BaseTheme::drawProgressBar(const GfxRenderer& renderer, Rect rect, const si
   renderer.drawCenteredText(UI_10_FONT_ID, rect.y + rect.height + 15, percentText.c_str());
 }
 
+int BaseTheme::getButtonHintsHeight(bool withSubtitle) const {
+  return BaseMetrics::values.buttonHintsHeight + (withSubtitle ? kButtonHintSubtitleExtra : 0);
+}
+
+void BaseTheme::ditherEraseRect(const GfxRenderer& renderer, int x, int y, int width, int height) {
+  for (int py = y; py < y + height; py++) {
+    for (int px = x; px < x + width; px++) {
+      if ((px + py) & 1) {
+        renderer.drawPixel(px, py, false);
+      }
+    }
+  }
+}
+
 void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                 const char* btn4, const char* sub1, const char* sub2, const char* sub3,
                                 const char* sub4) const {
@@ -146,31 +161,34 @@ void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
 
   const int pageHeight = renderer.getScreenHeight();
   constexpr int buttonWidth = 106;
-  constexpr int buttonHeight = BaseMetrics::values.buttonHintsHeight;
-  constexpr int buttonY = BaseMetrics::values.buttonHintsHeight;  // Distance from bottom
-  constexpr int textYOffset = 7;                                  // Distance from top of button to text baseline
-  constexpr int subtitleYOffset = 23;                             // Subtitle sits below the main label
+  const char* labels[] = {btn1, btn2, btn3, btn4};
+  const char* subtitles[] = {sub1, sub2, sub3, sub4};
+  constexpr int textYOffset = 7;       // Distance from top of button to main-label baseline
+  constexpr int subtitleYOffset = 30;  // Subtitle baseline inside the extended tab
   // X3 has wider screen in portrait (528 vs 480), use more spacing
   constexpr int x4ButtonPositions[] = {25, 130, 245, 350};
   constexpr int x3ButtonPositions[] = {38, 154, 268, 384};
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
-  const char* labels[] = {btn1, btn2, btn3, btn4};
-  const char* subtitles[] = {sub1, sub2, sub3, sub4};
 
   for (int i = 0; i < 4; i++) {
     // Only draw if the label is non-empty
     if (labels[i] != nullptr && labels[i][0] != '\0') {
+      const bool hasSubtitle = subtitles[i] != nullptr && subtitles[i][0] != '\0';
+      const int buttonHeight = getButtonHintsHeight(hasSubtitle);
+      const int buttonTop = pageHeight - buttonHeight;
       const int x = buttonPositions[i];
-      renderer.fillRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, false);
-      renderer.drawRect(x, pageHeight - buttonY, buttonWidth, buttonHeight);
+      renderer.fillRect(x, buttonTop, buttonWidth, buttonHeight, false);
+      renderer.drawRect(x, buttonTop, buttonWidth, buttonHeight);
       const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
-      renderer.drawText(UI_10_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+      renderer.drawText(UI_10_FONT_ID, textX, buttonTop + textYOffset, labels[i]);
 
-      if (subtitles[i] != nullptr && subtitles[i][0] != '\0') {
+      if (hasSubtitle) {
         const int subWidth = renderer.getTextWidth(SMALL_FONT_ID, subtitles[i]);
         const int subX = x + (buttonWidth - 1 - subWidth) / 2;
-        renderer.drawText(SMALL_FONT_ID, subX, pageHeight - buttonY + subtitleYOffset, subtitles[i]);
+        const int subY = buttonTop + subtitleYOffset;
+        renderer.drawText(SMALL_FONT_ID, subX, subY, subtitles[i]);
+        ditherEraseRect(renderer, subX, subY, subWidth, renderer.getLineHeight(SMALL_FONT_ID));
       }
     }
   }
@@ -314,10 +332,13 @@ void BaseTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, 
 }
 
 void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle) const {
-  // Hide last battery draw
+  // Hide last battery draw. Extra width on the left covers the sync indicator so
+  // it gets cleared when sync transitions running→idle without needing a second
+  // fillRect for that specific case.
   constexpr int maxBatteryWidth = 80;
-  renderer.fillRect(rect.x + rect.width - maxBatteryWidth, rect.y + 5, maxBatteryWidth,
-                    BaseMetrics::values.batteryHeight + 10, false);
+  constexpr int syncIndicatorWidth = 45;
+  renderer.fillRect(rect.x + rect.width - maxBatteryWidth - syncIndicatorWidth, rect.y + 5,
+                    maxBatteryWidth + syncIndicatorWidth, BaseMetrics::values.batteryHeight + 10, false);
 
   const bool showBatteryPercentage =
       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
@@ -326,6 +347,24 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
   drawBatteryRight(renderer,
                    Rect{batteryX, rect.y + 5, BaseMetrics::values.batteryWidth, BaseMetrics::values.batteryHeight},
                    showBatteryPercentage);
+
+  // Sync indicator: small "SYNC" text left of the battery while the background
+  // sync service is running, so users on Home / Reader see something is happening
+  // without needing to navigate to the Subscriptions Inbox. Querying the service
+  // directly here lets all 24 header callers surface the indicator without each
+  // having to thread a bool through.
+  if (SubscriptionSyncService::instance().isRunning()) {
+    const char* syncLabel = "SYNC";
+    const int syncTextWidth = renderer.getTextWidth(SMALL_FONT_ID, syncLabel);
+    int batteryAreaLeft = batteryX;
+    if (showBatteryPercentage) {
+      const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+      const int percentTextWidth = renderer.getTextWidth(SMALL_FONT_ID, percentageText.c_str());
+      batteryAreaLeft = batteryX - percentTextWidth - BaseTheme::batteryPercentSpacing;
+    }
+    constexpr int syncPadding = 10;
+    renderer.drawText(SMALL_FONT_ID, batteryAreaLeft - syncTextWidth - syncPadding, rect.y + 5, syncLabel);
+  }
 
   if (title) {
     int padding = rect.width - batteryX + BaseMetrics::values.batteryWidth;

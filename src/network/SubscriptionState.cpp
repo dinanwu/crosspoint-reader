@@ -35,6 +35,20 @@ uint16_t SubscriptionState::readWatermark(const std::string& epubPath) {
   return static_cast<uint16_t>(buf[0] | (buf[1] << 8));
 }
 
+bool SubscriptionState::writeWatermark(const std::string& epubPath, uint16_t spineCount) {
+  const std::string cacheDir = cachePathForEpub(epubPath);
+  Storage.mkdir(cacheDir.c_str());
+  const std::string path = cacheDir + "/sub_watermark.bin";
+  FsFile f;
+  if (!Storage.openFileForWrite("SUB", path, f)) {
+    return false;
+  }
+  const uint8_t buf[2] = {static_cast<uint8_t>(spineCount & 0xff), static_cast<uint8_t>((spineCount >> 8) & 0xff)};
+  f.write(buf, 2);
+  f.close();
+  return true;
+}
+
 bool SubscriptionState::load() {
   if (!Storage.exists(STATE_FILE_PATH)) {
     LOG_DBG("SUB", "No subscription state file; starting fresh");

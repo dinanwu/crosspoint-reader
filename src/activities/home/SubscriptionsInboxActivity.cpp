@@ -1,19 +1,69 @@
 #include "SubscriptionsInboxActivity.h"
 
+#include <Arduino.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "activities/ActivityManager.h"
-#include "activities/network/SubscriptionSyncActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/SubscriptionState.h"
+#include "network/SubscriptionSyncService.h"
+
+namespace {
+const char* phaseLabel(SubscriptionSyncer::Phase p) {
+  using Phase = SubscriptionSyncer::Phase;
+  switch (p) {
+    case Phase::Idle:
+    case Phase::ConnectingWifi:
+      return tr(STR_SYNC_CONNECTING_WIFI);
+    case Phase::SyncingTime:
+    case Phase::FetchingIndex:
+      return tr(STR_SYNC_FETCHING_INDEX);
+    case Phase::DownloadingEpub:
+      return tr(STR_SYNC_DOWNLOADING);
+    case Phase::Cleaning:
+      return tr(STR_SYNC_CLEANING);
+    case Phase::Done:
+      return tr(STR_SYNC_COMPLETE);
+    case Phase::Failed:
+      return tr(STR_SYNC_FAILED);
+    case Phase::Cancelled:
+      return tr(STR_SYNC_CANCELLED);
+  }
+  return "";
+}
+
+const char* failureLabel(SubscriptionSyncer::FailureReason r) {
+  using Reason = SubscriptionSyncer::FailureReason;
+  switch (r) {
+    case Reason::NoCredentials:
+      return tr(STR_SYNC_FAIL_NO_CREDS);
+    case Reason::WifiConnect:
+      return tr(STR_SYNC_FAIL_WIFI);
+    case Reason::IndexFetch:
+      return tr(STR_SYNC_FAIL_INDEX);
+    case Reason::IndexParse:
+      return tr(STR_SYNC_FAIL_PARSE);
+    case Reason::UnsupportedFormat:
+      return tr(STR_SYNC_FAIL_FORMAT);
+    case Reason::Unauthorized:
+      return tr(STR_SYNC_FAIL_AUTH);
+    case Reason::ServerError:
+      return tr(STR_SYNC_FAIL_SERVER);
+    case Reason::None:
+      break;
+  }
+  return "";
+}
+}  // namespace
 
 void SubscriptionsInboxActivity::loadEntries() {
   entries.clear();
@@ -23,21 +73,30 @@ void SubscriptionsInboxActivity::loadEntries() {
     return;
   }
 
-  const auto ids = state.unreadSeriesIds();
-  entries.reserve(ids.size());
-  for (const auto& id : ids) {
-    auto it = state.seriesMeta.find(id);
-    if (it == state.seriesMeta.end()) continue;
-    const auto& meta = it->second;
+  entries.reserve(state.seriesMeta.size());
+  for (const auto& kv : state.seriesMeta) {
+    const auto& meta = kv.second;
+    if (meta.localPath.empty()) continue;
+
     const uint16_t watermark = SubscriptionState::readWatermark(meta.localPath);
-    if (meta.lastKnownSpineCount <= watermark) continue;
+    const uint16_t unread =
+        meta.lastKnownSpineCount > watermark ? static_cast<uint16_t>(meta.lastKnownSpineCount - watermark) : 0;
 
     Entry e;
-    e.title = meta.title.empty() ? id : meta.title;
+    e.title = meta.title.empty() ? kv.first : meta.title;
     e.localPath = meta.localPath;
-    e.unreadCount = meta.lastKnownSpineCount - watermark;
+    e.unreadCount = unread;
+    e.lastSyncedMs = meta.lastSyncedMs;
     entries.push_back(std::move(e));
   }
+
+  // Series with new chapters float to the top; within each bucket, newest sync first.
+  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+    const bool aUnread = a.unreadCount > 0;
+    const bool bUnread = b.unreadCount > 0;
+    if (aUnread != bUnread) return aUnread;
+    return a.lastSyncedMs > b.lastSyncedMs;
+  });
 }
 
 void SubscriptionsInboxActivity::onEnter() {
@@ -47,6 +106,9 @@ void SubscriptionsInboxActivity::onEnter() {
   if (configured) {
     loadEntries();
   }
+  // Prime this against the current service result so loop() only triggers a
+  // reload when a *new* sync finishes while we're visible.
+  lastSeenResultMs = SubscriptionSyncService::instance().lastResult().finishedAtMs;
   selectorIndex = 0;
   requestUpdate();
 }
@@ -63,6 +125,20 @@ void SubscriptionsInboxActivity::loop() {
   using Button = MappedInputManager::Button;
   constexpr unsigned long LONG_PRESS_SYNC_MS = 1000;
 
+  auto& syncService = SubscriptionSyncService::instance();
+
+  // Pick up newly-downloaded series while the Inbox is still on screen —
+  // finishedAtMs is the only monotonic signal for "a sync just sealed".
+  const auto lastResult = syncService.lastResult();
+  if (lastResult.finishedAtMs != 0 && lastResult.finishedAtMs != lastSeenResultMs) {
+    lastSeenResultMs = lastResult.finishedAtMs;
+    loadEntries();
+    if (selectorIndex >= entries.size()) {
+      selectorIndex = entries.empty() ? 0 : (entries.size() - 1);
+    }
+    requestUpdate();
+  }
+
   if (mappedInput.wasReleased(Button::Back)) {
     onGoHome();
     return;
@@ -77,19 +153,16 @@ void SubscriptionsInboxActivity::loop() {
     return;
   }
 
-  // Long-press Confirm triggers a manual sync. Latch so the upcoming release
-  // doesn't also fire short-press Open. startActivityForResult() tears us down
-  // and rebuilds on return, so the flag only needs to survive until release.
+  // Latch so the upcoming release doesn't also fire short-press Open.
   if (!syncTriggeredByLongPress && mappedInput.isPressed(Button::Confirm) &&
       mappedInput.getHeldTime() >= LONG_PRESS_SYNC_MS) {
     syncTriggeredByLongPress = true;
-    startActivityForResult(std::make_unique<SubscriptionSyncActivity>(renderer, mappedInput),
-                           [this](const ActivityResult&) {
-                             loadEntries();
-                             if (selectorIndex >= entries.size()) {
-                               selectorIndex = entries.empty() ? 0 : entries.size() - 1;
-                             }
-                           });
+    if (syncService.isRunning()) {
+      syncService.cancel();
+    } else {
+      syncService.startIfIdle();
+    }
+    requestUpdate();
     return;
   }
 
@@ -100,6 +173,15 @@ void SubscriptionsInboxActivity::loop() {
     }
     if (!entries.empty() && selectorIndex < entries.size()) {
       onSelectBook(entries[selectorIndex].localPath);
+    } else if (entries.empty()) {
+      // With no books to open, Confirm is unambiguously the sync trigger — users
+      // shouldn't have to discover the long-press affordance to get started.
+      if (syncService.isRunning()) {
+        syncService.cancel();
+      } else {
+        syncService.startIfIdle();
+      }
+      requestUpdate();
     }
     return;
   }
@@ -132,14 +214,82 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
   const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SUBSCRIPTIONS));
 
-  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
-  const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  // One mutex take per frame — the three service fields would otherwise each
+  // acquire the mutex, and the separate acquires can interleave with the sync
+  // task's state publish to give the renderer an inconsistent view.
+  const auto state = SubscriptionSyncService::instance().fullSnapshot();
+  const bool syncRunning = state.running;
+  const auto& lastResult = state.lastResult;
+  const bool showLastFailure = !syncRunning && lastResult.phase == SubscriptionSyncer::Phase::Failed;
+  const bool showIdleStatus = !syncRunning && !showLastFailure && lastResult.finishedAtMs > 0;
+  const bool showBanner = syncRunning || showLastFailure || showIdleStatus;
+
+  int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+
+  if (showBanner) {
+    int y = contentTop;
+
+    if (syncRunning) {
+      const auto& prog = state.progress;
+      renderer.drawCenteredText(UI_10_FONT_ID, y, phaseLabel(prog.phase), true, EpdFontFamily::BOLD);
+      y += lineHeight + metrics.verticalSpacing;
+
+      if (prog.phase == SubscriptionSyncer::Phase::DownloadingEpub) {
+        if (prog.seriesTotal > 1) {
+          char seriesBuf[32];
+          snprintf(seriesBuf, sizeof(seriesBuf), tr(STR_SYNC_SERIES_PROGRESS), prog.seriesDone + 1, prog.seriesTotal);
+          renderer.drawCenteredText(UI_10_FONT_ID, y, seriesBuf);
+          y += lineHeight + metrics.verticalSpacing / 2;
+        }
+        if (!prog.currentTitle.empty()) {
+          const int maxTitleWidth = pageWidth - metrics.contentSidePadding * 2;
+          const std::string truncated =
+              renderer.truncatedText(UI_10_FONT_ID, prog.currentTitle.c_str(), maxTitleWidth);
+          renderer.drawCenteredText(UI_10_FONT_ID, y, truncated.c_str());
+          y += lineHeight + metrics.verticalSpacing;
+        }
+        if (prog.bytesTotal > 0) {
+          GUI.drawProgressBar(renderer,
+                              Rect{metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2,
+                                   metrics.progressBarHeight},
+                              prog.bytesDone, prog.bytesTotal);
+          y += metrics.progressBarHeight + metrics.verticalSpacing;
+        }
+      }
+    } else if (showLastFailure) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "%s: %s", tr(STR_SYNC_FAILED), failureLabel(lastResult.failure));
+      renderer.drawCenteredText(UI_10_FONT_ID, y, buf, true, EpdFontFamily::BOLD);
+      y += lineHeight + metrics.verticalSpacing;
+    } else {
+      // Compact "Synced X ago" line so a 304-fast-path run is still visible.
+      const uint32_t elapsedMs = millis() - static_cast<uint32_t>(lastResult.finishedAtMs);
+      char buf[64];
+      if (elapsedMs < 60UL * 1000UL) {
+        snprintf(buf, sizeof(buf), "%s", tr(STR_SYNC_JUST_NOW));
+      } else if (elapsedMs < 60UL * 60UL * 1000UL) {
+        snprintf(buf, sizeof(buf), tr(STR_SYNC_MIN_AGO), static_cast<unsigned>(elapsedMs / 60000UL));
+      } else {
+        snprintf(buf, sizeof(buf), tr(STR_SYNC_HOUR_AGO), static_cast<unsigned>(elapsedMs / 3600000UL));
+      }
+      renderer.drawCenteredText(UI_10_FONT_ID, y, buf);
+      y += lineHeight + metrics.verticalSpacing / 2;
+    }
+
+    contentTop = y + metrics.verticalSpacing / 2;
+  }
+
+  // Subtitle only renders for the "non-empty list" case (where the short-press Open
+  // is distinct from the long-press Sync). Empty-list states fit in a plain tab.
+  const bool anyHintSubtitle = configured && !entries.empty();
+  const int hintsHeight = GUI.getButtonHintsHeight(anyHintSubtitle);
+  const int contentHeight = pageHeight - contentTop - hintsHeight - metrics.verticalSpacing;
 
   if (!configured) {
-    const auto lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
     int y = contentTop + contentHeight / 2 - lineHeight * 2;
     renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_SUBS_NOT_CONFIGURED), true, EpdFontFamily::BOLD);
     y += lineHeight * 2;
@@ -156,24 +306,81 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   }
 
   if (entries.empty()) {
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, tr(STR_SYNC_NO_CHANGES));
+    // "No new chapters" is only correct if a sync has completed and found nothing
+    // new. On first boot (or after a wipe of state.json) entries is empty because
+    // nothing has ever synced — show a hint to trigger the first sync instead.
+    const char* msg = lastResult.finishedAtMs == 0 ? tr(STR_SUBS_NEVER_SYNCED) : tr(STR_SYNC_NO_CHANGES);
+    renderer.drawCenteredText(UI_10_FONT_ID, contentTop + contentHeight / 2, msg);
   } else {
-    GUI.drawList(
-        renderer, Rect{0, contentTop, pageWidth, contentHeight}, entries.size(), selectorIndex,
-        [this](int index) { return entries[index].title; }, nullptr,
-        [this](int index) { return UITheme::getFileIcon(entries[index].localPath); },
-        [this](int index) {
-          char buf[16];
-          snprintf(buf, sizeof(buf), tr(STR_INBOX_UNREAD_COUNT), entries[index].unreadCount);
-          return std::string(buf);
-        });
+    // entries is sorted unread-first, so the split point is just after the last unread row.
+    size_t unreadCount = 0;
+    while (unreadCount < entries.size() && entries[unreadCount].unreadCount > 0) unreadCount++;
+    const size_t caughtUpCount = entries.size() - unreadCount;
+
+    const int subHeaderH = lineHeight + metrics.verticalSpacing;
+    const int rowH = metrics.listRowHeight;
+
+    auto rowTitle = [this](size_t startIdx, int i) { return entries[startIdx + i].title; };
+    auto rowIcon = [this](size_t startIdx, int i) { return UITheme::getFileIcon(entries[startIdx + i].localPath); };
+    auto rowValue = [this](size_t startIdx, int i) {
+      const auto& e = entries[startIdx + i];
+      if (e.unreadCount == 0) return std::string{};
+      char buf[16];
+      snprintf(buf, sizeof(buf), tr(STR_INBOX_UNREAD_COUNT), e.unreadCount);
+      return std::string(buf);
+    };
+
+    auto renderSection = [&](const char* header, size_t startIdx, size_t count, int& y, int allocatedH) {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y, header, true, EpdFontFamily::BOLD);
+      y += subHeaderH;
+      const int listH = allocatedH - subHeaderH;
+      const int localSel = (selectorIndex >= startIdx && selectorIndex < startIdx + count)
+                               ? static_cast<int>(selectorIndex - startIdx)
+                               : -1;
+      GUI.drawList(
+          renderer, Rect{0, y, pageWidth, listH}, static_cast<int>(count), localSel,
+          [&rowTitle, startIdx](int i) { return rowTitle(startIdx, i); }, nullptr,
+          [&rowIcon, startIdx](int i) { return rowIcon(startIdx, i); },
+          [&rowValue, startIdx](int i) { return rowValue(startIdx, i); });
+      y += listH;
+    };
+
+    int y = contentTop;
+    int remainingH = contentHeight;
+
+    if (unreadCount > 0 && caughtUpCount > 0) {
+      const int unreadNaturalH = static_cast<int>(unreadCount) * rowH + subHeaderH;
+      const int unreadH = std::min(unreadNaturalH, remainingH / 2);
+      renderSection(tr(STR_NEW_CHAPTERS_HEADER), 0, unreadCount, y, unreadH);
+      renderSection(tr(STR_INBOX_SECTION_CAUGHT_UP), unreadCount, caughtUpCount, y, remainingH - unreadH);
+    } else if (unreadCount > 0) {
+      renderSection(tr(STR_NEW_CHAPTERS_HEADER), 0, unreadCount, y, remainingH);
+    } else {
+      renderSection(tr(STR_INBOX_SECTION_CAUGHT_UP), 0, caughtUpCount, y, remainingH);
+    }
   }
 
-  const char* confirmLabel = entries.empty() ? "" : tr(STR_OPEN);
+  // Confirm label depends on context:
+  //   - non-empty list → short-press opens the selected book; subtitle hints long-press
+  //   - empty list + idle → short-press starts sync directly (unambiguous)
+  //   - empty list + running → short-press cancels (unambiguous)
+  // Long-press still works everywhere as a convenience.
+  const char* confirmLabel;
+  if (!entries.empty()) {
+    confirmLabel = tr(STR_OPEN);
+  } else if (syncRunning) {
+    confirmLabel = tr(STR_CANCEL);
+  } else {
+    confirmLabel = tr(STR_SYNC_NOW);
+  }
+  // Subtitle advertises the long-press affordance, but only when it means something
+  // different from the short-press main label — otherwise it's redundant noise.
+  const char* confirmSubtitle = "";
+  if (!entries.empty()) {
+    confirmSubtitle = syncRunning ? tr(STR_HOLD_TO_CANCEL) : tr(STR_HOLD_TO_SYNC);
+  }
   const auto labels = mappedInput.mapLabels(tr(STR_HOME), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-  // Long-press on Confirm triggers a manual sync; advertise it as a subtitle on the
-  // Open button so the affordance is discoverable without its own button slot.
-  const auto subtitles = mappedInput.mapLabels("", tr(STR_HOLD_TO_SYNC), "", "");
+  const auto subtitles = mappedInput.mapLabels("", confirmSubtitle, "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, subtitles.btn1, subtitles.btn2,
                       subtitles.btn3, subtitles.btn4);
 

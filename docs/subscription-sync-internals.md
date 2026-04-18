@@ -251,8 +251,8 @@ On observed abort, the task lands on `Phase::Cancelled` (not `Failed`) if the tr
 
 Two bytes, little-endian unsigned int. Presence of the file marks the EPUB as a subscription.
 
-- **Seeded** by the syncer on first download at the current `chapterCount` from the index — a fresh subscribe shows 0 unread; the next sync's additions are the first delta.
-- **Re-armed** by the reader on `onExit()` to the current spine count.
+- **Seeded** by the syncer on first download at `0` — a fresh subscribe reports every chapter as unread so the inbox surfaces the series under "New chapters". The reader suppresses the break page when `watermark == 0` to avoid a "— N new chapters —" interstitial before the user has read anything.
+- **Re-armed** by the reader on `onExit()` to the current spine count, after which subsequent syncs that grow the spine will trigger the break page on next open.
 - **Never overwritten** by subsequent syncs — the reader owns the file after the initial seed.
 
 ### EPUB files — `/.subscriptions/<series-id>.epub`
@@ -303,10 +303,11 @@ sequenceDiagram
     Reader->>SD: write sub_watermark.bin = 45
 ```
 
-`shouldShowBreakPage()` combines three conditions:
+`shouldShowBreakPage()` combines these conditions:
 
 - `isSubscription` (sidecar exists) AND
 - `!breakPageDismissed` (not yet dismissed this session) AND
+- `watermarkSpineCount > 0` (not a first-ever open — the syncer seeds freshly-subscribed series at `0`) AND
 - `watermarkSpineCount < spineCount` (there are new chapters) AND
 - `currentSpineIndex >= watermarkSpineCount` (user has reached them) AND
 - `currentSpineIndex < spineCount` (not past the end).

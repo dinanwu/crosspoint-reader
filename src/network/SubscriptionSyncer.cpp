@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Epub.h>
-#include <HalGPIO.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <WiFi.h>
@@ -60,10 +59,6 @@ std::string epubPathForId(const std::string& seriesId) {
 std::string partPathForId(const std::string& seriesId) { return epubPathForId(seriesId) + ".part"; }
 }  // namespace
 
-std::string SubscriptionSyncer::epubCachePath(const std::string& epubPath) {
-  return std::string(EPUB_CACHE_DIR) + "/epub_" + std::to_string(std::hash<std::string>{}(epubPath));
-}
-
 std::string SubscriptionSyncer::normalizeServerUrl(std::string url) {
   auto isSpace = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
   while (!url.empty() && isSpace(url.back())) url.pop_back();
@@ -86,6 +81,17 @@ std::string SubscriptionSyncer::normalizeServerUrl(std::string url) {
 bool SubscriptionSyncer::begin() {
   progress_ = Progress{};
   transitionTo(Phase::Idle);
+
+  // Reset all per-run transient state — a prior Cancelled/Failed run leaves these
+  // set, which would otherwise poison the next run (notably abortRequested_, which
+  // would flip the very next tick() straight to Cancelled without doing any work).
+  abortRequested_ = false;
+  indexUnchanged_ = false;
+  seriesFromIndex_.clear();
+  orphanIds_.clear();
+  seriesIndex_ = 0;
+  orphanIndex_ = 0;
+  newIndexEtag_.clear();
 
   if (!SETTINGS.subscriptionsEnabled) {
     LOG_DBG("SUB", "Subscriptions disabled");
@@ -347,20 +353,11 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     progress_.bytesDone = downloaded;
     progress_.bytesTotal = total > 0 ? total : reportedTotal;
 
-    // Give the owning activity a chance to re-render. tick() is blocking inside
-    // HTTPClient::writeToStream, so its loop() never runs — without this hook the
-    // activity has no way to observe progress until the download finishes.
+    // Give the UI a chance to re-render. The download runs on the SubSync task,
+    // so without this hook the inbox never sees byte progress between the
+    // phase-boundary publishes from taskBody().
     if (progressListener_) {
       progressListener_();
-    }
-
-    // The HTTP download blocks the main loop, so service button input here.
-    // Without this, the user cannot press Back to cancel, and the Failed/Cancelled
-    // screen's Back hint appears unresponsive because gpio.update() isn't running.
-    gpio.update();
-    if (gpio.wasReleased(SETTINGS.frontButtonBack)) {
-      LOG_DBG("SUB", "Back released during download, aborting");
-      abortRequested_ = true;
     }
     return !abortRequested_;
   };
@@ -416,11 +413,25 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   }
 
   // Invalidate the book.bin cache so Epub::load picks up the new spine on next open.
-  // Leave sections/, progress.bin, and the watermark sidecar alone.
-  const std::string cachePath = epubCachePath(destPath);
+  // Leave sections/ and progress.bin alone.
+  const std::string cachePath = SubscriptionState::cachePathForEpub(destPath);
   const std::string bookBinPath = cachePath + "/book.bin";
   if (Storage.exists(bookBinPath.c_str())) {
     Storage.remove(bookBinPath.c_str());
+  }
+
+  // Seed at 0 on first download (never overwrite an existing sidecar — the reader
+  // owns it after that). A fresh subscribe reports every chapter as unread so the
+  // inbox surfaces it under "New chapters". The reader suppresses the break page
+  // for watermark == 0 (first-ever open), so users don't hit a "N new chapters"
+  // interstitial before they've read anything.
+  const std::string watermarkPath = cachePath + "/sub_watermark.bin";
+  if (!Storage.exists(watermarkPath.c_str())) {
+    if (SubscriptionState::writeWatermark(destPath, 0)) {
+      LOG_DBG("SUB", "Seeded watermark for '%s' at 0 (chapterCount=%u)", series.id.c_str(), series.chapterCount);
+    } else {
+      LOG_ERR("SUB", "Failed to seed watermark for '%s'", series.id.c_str());
+    }
   }
 
   // Persist the new etag immediately so a crash mid-sync doesn't re-download what we
@@ -464,7 +475,7 @@ void SubscriptionSyncer::populateSeriesMeta(const std::string& seriesId, const s
 void SubscriptionSyncer::cleanupOrphans() {
   for (const auto& orphanId : orphanIds_) {
     const std::string epubPath = epubPathForId(orphanId);
-    const std::string cachePath = epubCachePath(epubPath);
+    const std::string cachePath = SubscriptionState::cachePathForEpub(epubPath);
 
     if (Storage.exists(epubPath.c_str())) {
       Storage.remove(epubPath.c_str());

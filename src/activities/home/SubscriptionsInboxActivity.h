@@ -25,6 +25,7 @@ class SubscriptionsInboxActivity final : public Activity {
     std::string title;
     std::string localPath;
     uint16_t unreadCount = 0;
+    uint64_t lastSyncedMs = 0;
   };
 
   ButtonNavigator buttonNavigator;
@@ -34,6 +35,10 @@ class SubscriptionsInboxActivity final : public Activity {
   // True once a long-press of Confirm has fired the sync, so the subsequent
   // release doesn't also trigger the short-press Open action.
   bool syncTriggeredByLongPress = false;
+  // Tracks the most recent SubscriptionSyncService result we've reacted to, so
+  // loadEntries() runs exactly once per completed background sync while the
+  // Inbox is visible.
+  uint64_t lastSeenResultMs = 0;
 
   void loadEntries();
 };

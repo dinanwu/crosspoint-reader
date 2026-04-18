@@ -36,6 +36,10 @@ class SubscriptionState {
   // Returns 0 if the sidecar file is missing (never-opened book).
   static uint16_t readWatermark(const std::string& epubPath);
 
+  // Writes the watermark sidecar. Creates the cache directory if missing, so this
+  // is safe to call during first-download seeding before the book has been opened.
+  static bool writeWatermark(const std::string& epubPath, uint16_t spineCount);
+
   // Computes the cache directory path used by the Epub class for a given EPUB.
   // Mirrors Epub's cachePath hashing (std::hash<std::string>{}(filepath)).
   static std::string cachePathForEpub(const std::string& epubPath);

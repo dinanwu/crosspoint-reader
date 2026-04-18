@@ -132,8 +132,8 @@ Option 1 is the most consistent with existing patterns (battery/wifi glyphs). Op
 
 **Files**: `src/activities/home/HomeActivity.{h,cpp}`, `src/components/themes/BaseTheme.cpp` (for header glyph).
 
-- [ ] Design direction chosen
-- [ ] Implementation
+- [x] Design direction chosen — option 1 (status-row glyph)
+- [x] Implementation — small "SYNC" text in `drawHeader` on both themes (queries `SubscriptionSyncService::isRunning()` directly so every screen gets the indicator)
 - [ ] Hardware-verified across both themes (Base + Lyra)
 
 ---
@@ -146,7 +146,7 @@ Option 1 is the most consistent with existing patterns (battery/wifi glyphs). Op
 
 **Fix**: in the downloading banner, above the current title, render `snprintf(..., tr(STR_SYNC_SERIES_PROGRESS), seriesDone + 1, seriesTotal)` when `seriesTotal > 1`.
 
-- [ ] Rendered
+- [x] Rendered
 - [ ] Verified with 3+ series sync
 
 ---
@@ -166,8 +166,8 @@ The subtitle's whole purpose is to advertise a long-press affordance. Just "Sync
 
 Other languages inherit the English fallback, so only `english.yaml` needs updating unless translators want to add locale-specific variants.
 
-- [ ] Copy updated
-- [ ] Fits in button-hint width in both themes
+- [x] Copy updated — `"Hold: Sync"` / `"Hold: Cancel"`
+- [ ] Fits in button-hint width in both themes (hardware check)
 
 ---
 
@@ -190,8 +190,8 @@ StateSnapshot fullSnapshot() const;
 
 Render consumes one snapshot per frame.
 
-- [ ] Accessor added
-- [ ] Render refactored
+- [x] Accessor added (`SubscriptionSyncService::fullSnapshot()`)
+- [x] Render refactored
 
 ---
 
@@ -208,8 +208,8 @@ Configured + empty `entries` renders `STR_SYNC_NO_CHANGES = "No new chapters"`. 
 
 Alternatively, auto-trigger `startIfIdle()` on first-ever Inbox entry when configured and never-synced. Debatable whether that's surprising behavior.
 
-- [ ] Branch added
-- [ ] New string (if needed) added to `english.yaml`
+- [x] Branch added
+- [x] New string added: `STR_SUBS_NEVER_SYNCED: "Hold Confirm to sync"`
 
 ---
 

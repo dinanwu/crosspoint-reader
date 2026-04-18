@@ -103,10 +103,6 @@ class SubscriptionSyncer {
   void populateSeriesMeta(const std::string& seriesId, const std::string& title, const std::string& epubPath,
                           uint16_t chapterCount);
 
-  // Recovers the Epub cache directory that corresponds to an EPUB path, so we can
-  // invalidate book.bin (and optionally remove the whole dir on unsubscribe).
-  static std::string epubCachePath(const std::string& epubPath);
-
   Progress progress_;
   SubscriptionState state_;
   std::string serverUrl_;

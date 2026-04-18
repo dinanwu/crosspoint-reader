@@ -113,11 +113,15 @@ class BaseTheme {
   virtual void drawBatteryRight(const GfxRenderer& renderer, Rect rect,
                                 bool showPercentage = true) const;  // Right aligned (UI headers)
   // The optional sub* params render a smaller-font subtitle line beneath the main
-  // label, intended for long-press affordances (e.g. "Hold: Sync" below "Open").
+  // label, intended for long-press affordances (e.g. "Sync" below "Open").
   // Pass nullptr to omit the subtitle for that slot.
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                const char* btn4, const char* sub1 = nullptr, const char* sub2 = nullptr,
                                const char* sub3 = nullptr, const char* sub4 = nullptr) const;
+  // Vertical space reserved at the bottom of the screen for the button hint row.
+  // Pass withSubtitle=true if any tab will render a subtitle — tall tabs jut up
+  // past the standard height and content above must make room.
+  virtual int getButtonHintsHeight(bool withSubtitle = false) const;
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
   virtual void drawList(const GfxRenderer& renderer, Rect rect, int itemCount, int selectedIndex,
                         const std::function<std::string(int index)>& rowTitle,
@@ -151,4 +155,14 @@ class BaseTheme {
   static constexpr int batteryPercentSpacing = 4;
   static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight);
   static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY);
+
+  // Vertical slack added to a button hint tab when it carries a subtitle. Subclasses
+  // reuse this so all themes share the same "tall tab" extent.
+  static constexpr int kButtonHintSubtitleExtra = 14;
+
+ protected:
+  // 50% checkerboard erasure over a rect. Used post-draw to knock the strokes of
+  // pre-rendered text down to ~50% gray on a white background without repainting
+  // the glyphs. E-ink has no grayscale text mode, hence the manual dither.
+  static void ditherEraseRect(const GfxRenderer& renderer, int x, int y, int width, int height);
 };

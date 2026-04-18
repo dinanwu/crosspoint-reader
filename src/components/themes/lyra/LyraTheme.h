@@ -57,6 +57,7 @@ class LyraTheme : public BaseTheme {
   void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3, const char* btn4,
                        const char* sub1 = nullptr, const char* sub2 = nullptr, const char* sub3 = nullptr,
                        const char* sub4 = nullptr) const override;
+  int getButtonHintsHeight(bool withSubtitle = false) const override;
   void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const override;
   void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                       const std::function<std::string(int index)>& buttonLabel,

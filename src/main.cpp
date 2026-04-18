@@ -20,9 +20,10 @@
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
+#include "WifiCredentialStore.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
-#include "activities/network/SubscriptionSyncActivity.h"
+#include "network/SubscriptionSyncService.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ButtonNavigator.h"
@@ -258,6 +259,11 @@ void setup() {
   SETTINGS.loadFromFile();
   I18N.loadSettings();
   KOREADER_STORE.loadFromFile();
+  // WIFI_STORE must be loaded at boot so the PowerButton-wake subscription sync
+  // (and any other pre-selection-screen network path) can see saved credentials.
+  // Was previously only loaded inside WifiSelectionActivity::onEnter, which made
+  // auto-sync look broken on any boot before the user visited Wi-Fi settings.
+  WIFI_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
 
@@ -307,13 +313,10 @@ void setup() {
     activityManager.goToReader(path);
   }
 
-  // On power-button wakes, push the subscription sync activity on top of whatever
-  // home/reader dispatch just picked. The activity silently finishes if subscriptions
-  // aren't enabled / configured, or if no Wi-Fi credentials are saved.
-  if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !HalSystem::isRebootFromPanic() &&
-      SETTINGS.subscriptionsEnabled && strlen(SETTINGS.subscriptionServerUrl) > 0 &&
-      strlen(SETTINGS.subscriptionBearerToken) > 0) {
-    activityManager.pushActivity(std::make_unique<SubscriptionSyncActivity>(renderer, mappedInputManager));
+  // Sync in the background on power-button wake; the service self-aborts if
+  // subscriptions aren't configured. Results surface via the Subscriptions Inbox.
+  if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !HalSystem::isRebootFromPanic()) {
+    SubscriptionSyncService::instance().startIfIdle();
   }
 
   // Ensure we're not still holding the power button before leaving setup

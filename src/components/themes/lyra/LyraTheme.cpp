@@ -27,6 +27,7 @@
 #include "components/icons/transfer.h"
 #include "components/icons/wifi.h"
 #include "fontIds.h"
+#include "network/SubscriptionSyncService.h"
 
 // Internal constants
 namespace {
@@ -149,6 +150,21 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
   drawBatteryRight(renderer,
                    Rect{batteryX, rect.y + 5, LyraMetrics::values.batteryWidth, LyraMetrics::values.batteryHeight},
                    showBatteryPercentage);
+
+  // Sync indicator: mirrors BaseTheme::drawHeader. The full-rect fill at the top
+  // already clears any previous "SYNC" text, so no extra clear is needed here.
+  if (SubscriptionSyncService::instance().isRunning()) {
+    const char* syncLabel = "SYNC";
+    const int syncTextWidth = renderer.getTextWidth(SMALL_FONT_ID, syncLabel);
+    int batteryAreaLeft = batteryX;
+    if (showBatteryPercentage) {
+      const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+      const int percentTextWidth = renderer.getTextWidth(SMALL_FONT_ID, percentageText.c_str());
+      batteryAreaLeft = batteryX - percentTextWidth - BaseTheme::batteryPercentSpacing;
+    }
+    constexpr int syncPadding = 10;
+    renderer.drawText(SMALL_FONT_ID, batteryAreaLeft - syncTextWidth - syncPadding, rect.y + 5, syncLabel);
+  }
 
   int maxTitleWidth =
       rect.width - LyraMetrics::values.contentSidePadding * 2 - (subtitle != nullptr ? maxSubtitleWidth : 0);
@@ -314,6 +330,10 @@ void LyraTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, 
   }
 }
 
+int LyraTheme::getButtonHintsHeight(bool withSubtitle) const {
+  return LyraMetrics::values.buttonHintsHeight + (withSubtitle ? kButtonHintSubtitleExtra : 0);
+}
+
 void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                 const char* btn4, const char* sub1, const char* sub2, const char* sub3,
                                 const char* sub4) const {
@@ -323,32 +343,35 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   const int pageHeight = renderer.getScreenHeight();
   constexpr int buttonWidth = 80;
   constexpr int smallButtonHeight = 15;
-  constexpr int buttonHeight = LyraMetrics::values.buttonHintsHeight;
-  constexpr int buttonY = LyraMetrics::values.buttonHintsHeight;  // Distance from bottom
-  constexpr int textYOffset = 7;                                  // Distance from top of button to text baseline
-  constexpr int subtitleYOffset = 22;                             // Subtitle sits below the main label
+  const char* labels[] = {btn1, btn2, btn3, btn4};
+  const char* subtitles[] = {sub1, sub2, sub3, sub4};
+  constexpr int textYOffset = 7;       // Distance from top of button to main-label baseline
+  constexpr int subtitleYOffset = 28;  // Subtitle baseline inside the extended tab
   // X3 has wider screen in portrait (528 vs 480), use more spacing
   constexpr int x4ButtonPositions[] = {58, 146, 254, 342};
   constexpr int x3ButtonPositions[] = {65, 157, 291, 383};
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
-  const char* labels[] = {btn1, btn2, btn3, btn4};
-  const char* subtitles[] = {sub1, sub2, sub3, sub4};
 
   for (int i = 0; i < 4; i++) {
     const int x = buttonPositions[i];
     if (labels[i] != nullptr && labels[i][0] != '\0') {
+      const bool hasSubtitle = subtitles[i] != nullptr && subtitles[i][0] != '\0';
+      const int buttonHeight = getButtonHintsHeight(hasSubtitle);
+      const int buttonTop = pageHeight - buttonHeight;
       // Draw the filled background and border for a FULL-sized button
-      renderer.fillRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, cornerRadius, Color::White);
-      renderer.drawRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, 1, cornerRadius, true, true, false,
-                               false, true);
+      renderer.fillRoundedRect(x, buttonTop, buttonWidth, buttonHeight, cornerRadius, Color::White);
+      renderer.drawRoundedRect(x, buttonTop, buttonWidth, buttonHeight, 1, cornerRadius, true, true, false, false,
+                               true);
       const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
-      renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+      renderer.drawText(SMALL_FONT_ID, textX, buttonTop + textYOffset, labels[i]);
 
-      if (subtitles[i] != nullptr && subtitles[i][0] != '\0') {
+      if (hasSubtitle) {
         const int subWidth = renderer.getTextWidth(SMALL_FONT_ID, subtitles[i]);
         const int subX = x + (buttonWidth - 1 - subWidth) / 2;
-        renderer.drawText(SMALL_FONT_ID, subX, pageHeight - buttonY + subtitleYOffset, subtitles[i]);
+        const int subY = buttonTop + subtitleYOffset;
+        renderer.drawText(SMALL_FONT_ID, subX, subY, subtitles[i]);
+        ditherEraseRect(renderer, subX, subY, subWidth, renderer.getLineHeight(SMALL_FONT_ID));
       }
     } else {
       // Draw the filled background and border for a SMALL-sized button

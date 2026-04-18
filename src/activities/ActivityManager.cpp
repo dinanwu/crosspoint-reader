@@ -2,6 +2,7 @@
 
 #include <HalPowerManager.h>
 
+#include "../network/SubscriptionSyncService.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
@@ -220,7 +221,10 @@ void ActivityManager::popActivity() {
   pendingAction = PendingAction::Pop;
 }
 
-bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
+bool ActivityManager::preventAutoSleep() const {
+  if (SubscriptionSyncService::instance().isRunning()) return true;
+  return currentActivity && currentActivity->preventAutoSleep();
+}
 
 bool ActivityManager::isReaderActivity() const { return currentActivity && currentActivity->isReaderActivity(); }
 
