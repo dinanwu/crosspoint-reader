@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <deque>
 #include <string>
+#include <vector>
 
 class BookMetadataCache {
  public:
@@ -50,6 +51,12 @@ class BookMetadataCache {
   bool loaded;
   bool buildMode;
 
+  // Minimal in-RAM mode: populated by becomeMinimal() so the reader can render page 0
+  // from just the spine hrefs while the full book.bin is built in the background.
+  // getTocEntry returns a default TocEntry{} while in this mode.
+  bool minimalMode = false;
+  std::vector<SpineEntry> memSpine;
+
   FsFile bookFile;
   // Temp file handles during build
   FsFile spineFile;
@@ -64,7 +71,10 @@ class BookMetadataCache {
   std::deque<SpineHrefIndexEntry> spineHrefIndex;
   bool useSpineHrefIndex = false;
 
-  static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
+  // Always use the batch hash-indexed href lookup. The fallback linear-scan path is O(n²) on SD
+  // (286-chapter books spend ~5s re-reading spine.bin.tmp during TOC join); the batch path's
+  // ~6KB transient heap cost is strictly cheaper regardless of book size.
+  static constexpr uint16_t LARGE_SPINE_THRESHOLD = 0;
 
   // FNV-1a 64-bit hash function
   static uint64_t fnvHash64(const std::string& s) {
@@ -104,9 +114,14 @@ class BookMetadataCache {
 
   // Reading phase (read mode)
   bool load();
+  // Populate the cache from in-RAM data produced by a fast OPF-only parse. Marks the
+  // cache as loaded in minimal mode — spine getters serve from RAM, TOC getters return
+  // default entries until the disk-backed cache is swapped in.
+  void becomeMinimal(std::vector<SpineEntry> spine, BookMetadata metadata);
   SpineEntry getSpineEntry(int index);
   TocEntry getTocEntry(int index);
   int getSpineCount() const { return spineCount; }
   int getTocCount() const { return tocCount; }
   bool isLoaded() const { return loaded; }
+  bool isMinimal() const { return minimalMode; }
 };

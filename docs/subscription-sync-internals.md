@@ -2,7 +2,7 @@
 
 Device-side implementation guide for the subscription sync feature. For the server wire contract (endpoints, JSON shapes, EPUB generation rules) see [subscription-sync.md](./subscription-sync.md).
 
-Audience: firmware contributors touching any file under `src/network/Subscription*` or the Subscriptions Inbox / break page UI.
+Audience: firmware contributors touching any file under `src/network/Subscription*` or the Subscriptions Inbox UI.
 
 ---
 
@@ -19,7 +19,7 @@ Audience: firmware contributors touching any file under `src/network/Subscriptio
 │         ├─ SubscriptionsInboxActivity: polls service snapshot,               │
 │         │   long-press Confirm routes to startIfIdle() / cancel()            │
 │         └─ EpubReaderActivity: reads/writes sub_watermark.bin,               │
-│             shows break page, auto-advances at book end                      │
+│             auto-advances at book end                                        │
 │                                                                              │
 │  ActivityManager::preventAutoSleep()                                         │
 │    └─ returns true while syncer is running (blocks inactivity timeout)       │
@@ -200,9 +200,8 @@ Long-press Confirm (≥1000 ms) toggles `startIfIdle()` / `cancel()`. A latch fl
 
 Detects subscription status on `onEnter()` by attempting to read `sub_watermark.bin`. If present, `isSubscription = true` and `watermarkSpineCount` is loaded. This drives two behaviors:
 
-1. **Break page**: shown exactly once when `currentSpineIndex >= watermarkSpineCount`, dismissed by a forward page turn. See `shouldShowBreakPage()` / `renderBreakPage()`.
-2. **Watermark re-arm**: on `onExit()`, writes the current spine count back so the next sync's additions become the next break-page trigger.
-3. **Auto-advance**: at end-of-book (`currentSpineIndex >= spine count` + forward press), calls `tryAutoAdvanceToNextSubscription()` which picks the most-recently-synced other subscription with unread chapters.
+1. **Watermark re-arm**: on `onExit()`, writes the current spine count back so the next sync's additions grow the inbox unread-count badge.
+2. **Auto-advance**: at end-of-book (`currentSpineIndex >= spine count` + forward press), calls `tryAutoAdvanceToNextSubscription()` which picks the most-recently-synced other subscription with unread chapters.
 
 ---
 
@@ -251,8 +250,8 @@ On observed abort, the task lands on `Phase::Cancelled` (not `Failed`) if the tr
 
 Two bytes, little-endian unsigned int. Presence of the file marks the EPUB as a subscription.
 
-- **Seeded** by the syncer on first download at `0` — a fresh subscribe reports every chapter as unread so the inbox surfaces the series under "New chapters". The reader suppresses the break page when `watermark == 0` to avoid a "— N new chapters —" interstitial before the user has read anything.
-- **Re-armed** by the reader on `onExit()` to the current spine count, after which subsequent syncs that grow the spine will trigger the break page on next open.
+- **Seeded** by the syncer on first download at `0` — a fresh subscribe reports every chapter as unread so the inbox surfaces the series under "New chapters".
+- **Re-armed** by the reader on `onExit()` to the current `lastKnownSpineCount` read from `state.json` (falling back to `epub->getSpineItemsCount()` if state.json is unavailable). Pulling from state.json keeps the watermark in the same coordinate system as the inbox's subtraction; using raw OPF spine count would drift whenever `server.chapterCount != getSpineItemsCount()` (e.g. when the OPF has cover/nav spine items the server doesn't count as chapters), and a single book open would permanently zero the badge.
 - **Never overwritten** by subsequent syncs — the reader owns the file after the initial seed.
 
 ### EPUB files — `/.subscriptions/<series-id>.epub`
@@ -281,40 +280,9 @@ An **unsubscribe** (series no longer in the index) nukes the entire cache dir vi
 
 ## Reader integration
 
-### Break page
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant Reader as EpubReaderActivity
-    participant SD
-
-    User->>Reader: opens subscription book
-    Reader->>SD: read sub_watermark.bin
-    SD-->>Reader: watermark=40
-    Note over Reader: spine count=45, currentSpineIndex=38
-    User->>Reader: page forward past chapter 40
-    Reader->>Reader: currentSpineIndex >= watermark<br/>→ shouldShowBreakPage() = true
-    Reader->>User: renders "New chapters<br/>5 new chapters since last read"
-    User->>Reader: page forward
-    Reader->>Reader: breakPageDismissed = true
-    Reader->>User: renders chapter 41 content
-    User->>Reader: exits reader
-    Reader->>SD: write sub_watermark.bin = 45
-```
-
-`shouldShowBreakPage()` combines these conditions:
-
-- `isSubscription` (sidecar exists) AND
-- `!breakPageDismissed` (not yet dismissed this session) AND
-- `watermarkSpineCount > 0` (not a first-ever open — the syncer seeds freshly-subscribed series at `0`) AND
-- `watermarkSpineCount < spineCount` (there are new chapters) AND
-- `currentSpineIndex >= watermarkSpineCount` (user has reached them) AND
-- `currentSpineIndex < spineCount` (not past the end).
-
 ### Watermark re-arm on exit
 
-The reader writes the current spine count to the sidecar on every `onExit()` for subscription books, regardless of whether new chapters were read. The next sync's additions will re-widen the gap and re-arm the break page.
+The reader writes the current spine count to the sidecar on every `onExit()` for subscription books, regardless of whether new chapters were read. The next sync's additions re-widen the gap, and the inbox shows the new delta as an unread-count badge on the series row.
 
 ### Auto-advance at book end
 
@@ -467,10 +435,6 @@ Orphan `.part` cleanup is **not** currently implemented — stale `.part` files 
 
 The "not configured" branch replaces the list with explanatory text and routes Confirm to the settings web server via `goToFileTransfer()`. The user configures URL + token from a phone or laptop, exits the web server, re-enters the Inbox, and sees the normal list.
 
-### Break page in reader
-
-Rendered by `EpubReaderActivity::renderBreakPage()` when the user pages into unread chapters. Dismissed by a single forward page turn.
-
 ### Settings
 
 - **Device settings** (`SettingsActivity`): toggle, server URL, bearer token (obfuscated).
@@ -498,7 +462,7 @@ URL normalization is done at sync time (not at save time) via `SubscriptionSynce
 |---|---|
 | `SUB` | Syncer, service, state (most subscription activity) |
 | `HTTP` | `HttpDownloader` (progress, write errors, byte counts, memory snapshots) |
-| `ERS` | `EpubReaderActivity` (watermark read/write, break page, auto-advance) |
+| `ERS` | `EpubReaderActivity` (watermark read/write, auto-advance) |
 | `WEB` | Settings web server (including `/api/subscriptions/test`) |
 | `ACT` | `ActivityManager` (activity transitions) |
 

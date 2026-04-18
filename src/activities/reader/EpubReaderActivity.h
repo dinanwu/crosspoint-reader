@@ -28,15 +28,16 @@ class EpubReaderActivity final : public Activity {
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
 
-  // Subscription break page (shown once on the first render at or past the watermark
-  // spine index — i.e. when the user pages into chapters added since they last opened
-  // the book). Detected by the presence of sub_watermark.bin next to progress.bin.
+  // Subscription series marker. Detected by the presence of sub_watermark.bin next
+  // to progress.bin. The watermark is rewritten on onExit to the current spine count
+  // so the inbox can compute an unread-chapter badge on next sync.
   bool isSubscription = false;
   uint16_t watermarkSpineCount = 0;
-  bool breakPageDismissed = false;
 
-  bool shouldShowBreakPage() const;
-  void renderBreakPage();
+  // Deferred until after the first successful page render so the background
+  // OPF/TOC parse doesn't compete with section-0 rendering for heap (see
+  // render() for the start call).
+  bool backgroundIndexerStarted = false;
 
   // End-of-book hand-off: if this is a subscription EPUB, transitions to the
   // most-recently-synced other subscription that still has unread chapters.

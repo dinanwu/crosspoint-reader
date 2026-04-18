@@ -23,6 +23,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/BookIndexService.h"
 #include "network/SubscriptionState.h"
 #include "util/ScreenshotUtil.h"
 
@@ -118,12 +119,30 @@ void EpubReaderActivity::onExit() {
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
-  // Re-arm the subscription watermark to the current spine count so the next
-  // sync-added chapters will trigger the break page again.
+  // Re-arm the subscription watermark so the next sync's additions grow the inbox
+  // unread-count badge. Pull the value from state.json's lastKnownSpineCount (same
+  // number the inbox uses for its subtraction) rather than epub->getSpineItemsCount(),
+  // because the server's chapterCount may not equal raw OPF spine count (e.g. cover
+  // or nav items). If the two were stored in different coordinate systems, a single
+  // book open would leave watermark > lastKnownSpineCount forever, permanently
+  // zeroing the badge.
   if (isSubscription && epub) {
-    const uint16_t spineCount = static_cast<uint16_t>(epub->getSpineItemsCount());
-    if (SubscriptionState::writeWatermark(epub->getPath(), spineCount)) {
-      LOG_DBG("ERS", "Watermark rewritten to %u", spineCount);
+    uint16_t newWatermark = 0;
+    SubscriptionState state;
+    if (state.load()) {
+      for (const auto& kv : state.seriesMeta) {
+        if (kv.second.localPath == epub->getPath() && kv.second.lastKnownSpineCount > 0) {
+          newWatermark = kv.second.lastKnownSpineCount;
+          break;
+        }
+      }
+    }
+    // Fallback for first-ever open before any sync has populated seriesMeta.
+    if (newWatermark == 0) {
+      newWatermark = static_cast<uint16_t>(epub->getSpineItemsCount());
+    }
+    if (SubscriptionState::writeWatermark(epub->getPath(), newWatermark)) {
+      LOG_DBG("ERS", "Watermark rewritten to %u", newWatermark);
     } else {
       LOG_ERR("ERS", "Failed to write watermark for %s", epub->getPath().c_str());
     }
@@ -132,41 +151,13 @@ void EpubReaderActivity::onExit() {
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
   section.reset();
+  // Must cancel any in-flight background cache build before the Epub is
+  // destroyed — the task holds a raw Epub* and dereferences `*this` (member
+  // strings, mutex, parse methods) at phase boundaries.
+  if (epub) {
+    BookIndexService::instance().cancelAndWait(epub.get());
+  }
   epub.reset();
-}
-
-bool EpubReaderActivity::shouldShowBreakPage() const {
-  if (!isSubscription || breakPageDismissed || !epub) return false;
-  // Suppress on the very first open: the syncer seeds watermark=0 so the inbox
-  // can mark a freshly-subscribed series as "New", but we don't want to greet
-  // the user with "— N new chapters —" before they've read anything. Subsequent
-  // opens write the watermark to the spine count on exit, so a nonzero value
-  // means "user has read this before; these are truly new chapters."
-  if (watermarkSpineCount == 0) return false;
-  const int spineCount = epub->getSpineItemsCount();
-  // Only show while there's something new to flag and we've actually reached it.
-  return watermarkSpineCount < spineCount && currentSpineIndex >= watermarkSpineCount && currentSpineIndex < spineCount;
-}
-
-void EpubReaderActivity::renderBreakPage() {
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
-  const auto lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
-
-  renderer.clearScreen();
-
-  const int centerY = pageHeight / 2;
-  renderer.drawCenteredText(UI_12_FONT_ID, centerY - lineHeight, tr(STR_NEW_CHAPTERS_HEADER), true,
-                            EpdFontFamily::BOLD);
-
-  char msg[64];
-  const int newCount = epub ? epub->getSpineItemsCount() - watermarkSpineCount : 0;
-  snprintf(msg, sizeof(msg), tr(STR_NEW_CHAPTERS_COUNT), newCount);
-  renderer.drawCenteredText(UI_12_FONT_ID, centerY + metrics.verticalSpacing, msg);
-
-  renderer.displayBuffer();
-  (void)pageWidth;  // reserved for future layout tweaks
 }
 
 void EpubReaderActivity::loop() {
@@ -536,16 +527,6 @@ void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
-  // If the break page is currently displayed, a forward press dismisses it and falls
-  // through to the normal chapter content; a backward press returns to the last page
-  // of the previous chapter (normal behaviour).
-  if (isForwardTurn && shouldShowBreakPage()) {
-    breakPageDismissed = true;
-    lastPageTurnTime = millis();
-    requestUpdate();
-    return;
-  }
-
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
@@ -595,14 +576,6 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
-    automaticPageTurnActive = false;
-    return;
-  }
-
-  // Subscription break page: shown once when the user first pages into content added
-  // since last open. Dismissed by a forward page turn (handled in pageTurn()).
-  if (shouldShowBreakPage()) {
-    renderBreakPage();
     automaticPageTurnActive = false;
     return;
   }
@@ -738,6 +711,14 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   if (pendingScreenshot) {
     pendingScreenshot = false;
     ScreenshotUtil::takeScreenshot(renderer);
+  }
+
+  // Kick the background OPF/TOC indexer only after the first page is on screen.
+  // Running it concurrently with the section-0 build starved the heap and
+  // aborted operator new mid-parse.
+  if (!backgroundIndexerStarted && epub->isCacheMinimal()) {
+    BookIndexService::instance().start(epub.get());
+    backgroundIndexerStarted = true;
   }
 }
 

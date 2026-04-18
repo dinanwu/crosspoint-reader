@@ -36,9 +36,11 @@ ContentOpfParser::~ContentOpfParser() {
   if (tempItemStore) {
     tempItemStore.close();
   }
-  const auto itemCachePath = cachePath + itemCacheFile;
-  if (Storage.exists(itemCachePath.c_str())) {
-    Storage.remove(itemCachePath.c_str());
+  if (!inMemoryMode) {
+    const auto itemCachePath = cachePath + itemCacheFile;
+    if (Storage.exists(itemCachePath.c_str())) {
+      Storage.remove(itemCachePath.c_str());
+    }
   }
 }
 
@@ -119,25 +121,29 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_MANIFEST;
-    if (!Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
+    if (!self->inMemoryMode) {
+      if (!Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
+        LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
+      }
     }
     return;
   }
 
   if (self->state == IN_PACKAGE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_SPINE;
-    if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
-    }
+    if (!self->inMemoryMode) {
+      if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
+        LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+      }
 
-    // Sort item index for binary search if we have enough items
-    if (self->itemIndex.size() >= LARGE_SPINE_THRESHOLD) {
-      std::sort(self->itemIndex.begin(), self->itemIndex.end(), [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
-        return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
-      });
-      self->useItemIndex = true;
-      LOG_DBG("COF", "Using fast index for %zu manifest items", self->itemIndex.size());
+      // Sort item index for binary search if we have enough items
+      if (self->itemIndex.size() >= LARGE_SPINE_THRESHOLD) {
+        std::sort(self->itemIndex.begin(), self->itemIndex.end(), [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
+          return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
+        });
+        self->useItemIndex = true;
+        LOG_DBG("COF", "Using fast index for %zu manifest items", self->itemIndex.size());
+      }
     }
     return;
   }
@@ -146,8 +152,10 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     self->state = IN_GUIDE;
     // TODO Remove print
     LOG_DBG("COF", "Entering guide state.");
-    if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+    if (!self->inMemoryMode) {
+      if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
+        LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+      }
     }
     return;
   }
@@ -188,18 +196,22 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       }
     }
 
-    // Record index entry for fast lookup later
-    if (self->tempItemStore) {
-      ItemIndexEntry entry;
-      entry.idHash = fnvHash(itemId);
-      entry.idLen = static_cast<uint16_t>(itemId.size());
-      entry.fileOffset = static_cast<uint32_t>(self->tempItemStore.position());
-      self->itemIndex.push_back(entry);
-    }
+    if (self->inMemoryMode) {
+      self->inMemoryItemMap.emplace(itemId, href);
+    } else {
+      // Record index entry for fast lookup later
+      if (self->tempItemStore) {
+        ItemIndexEntry entry;
+        entry.idHash = fnvHash(itemId);
+        entry.idLen = static_cast<uint16_t>(itemId.size());
+        entry.fileOffset = static_cast<uint32_t>(self->tempItemStore.position());
+        self->itemIndex.push_back(entry);
+      }
 
-    // Write items down to SD card
-    serialization::writeString(self->tempItemStore, itemId);
-    serialization::writeString(self->tempItemStore, href);
+      // Write items down to SD card
+      serialization::writeString(self->tempItemStore, itemId);
+      serialization::writeString(self->tempItemStore, href);
+    }
 
     if (itemId == self->coverItemId) {
       self->coverItemHref = href;
@@ -238,8 +250,8 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 
   // NOTE: This relies on spine appearing after item manifest (which is pretty safe as it's part of the EPUB spec)
-  // Only run the spine parsing if there's a cache to add it to
-  if (self->cache) {
+  // Run the spine parsing if there's either a SD-backed cache or an in-RAM output to populate.
+  if (self->cache || self->inMemoryMode) {
     if (self->state == IN_SPINE && (strcmp(name, "itemref") == 0 || strcmp(name, "opf:itemref") == 0)) {
       for (int i = 0; atts[i]; i += 2) {
         if (strcmp(atts[i], "idref") == 0) {
@@ -247,7 +259,13 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
           std::string href;
           bool found = false;
 
-          if (self->useItemIndex) {
+          if (self->inMemoryMode) {
+            auto it = self->inMemoryItemMap.find(idref);
+            if (it != self->inMemoryItemMap.end()) {
+              href = it->second;
+              found = true;
+            }
+          } else if (self->useItemIndex) {
             // Fast path: binary search
             uint32_t targetHash = fnvHash(idref);
             uint16_t targetLen = static_cast<uint16_t>(idref.size());
@@ -286,8 +304,12 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
             }
           }
 
-          if (found && self->cache) {
-            self->cache->createSpineEntry(href);
+          if (found) {
+            if (self->inMemoryMode) {
+              self->inMemorySpineHrefs.push_back(std::move(href));
+            } else if (self->cache) {
+              self->cache->createSpineEntry(href);
+            }
           }
         }
       }
@@ -346,19 +368,28 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_SPINE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_PACKAGE;
-    self->tempItemStore.close();
+    if (self->inMemoryMode) {
+      // Spine resolution is done; the idref→href map is no longer needed.
+      self->inMemoryItemMap.clear();
+    } else {
+      self->tempItemStore.close();
+    }
     return;
   }
 
   if (self->state == IN_GUIDE && (strcmp(name, "guide") == 0 || strcmp(name, "opf:guide") == 0)) {
     self->state = IN_PACKAGE;
-    self->tempItemStore.close();
+    if (!self->inMemoryMode) {
+      self->tempItemStore.close();
+    }
     return;
   }
 
   if (self->state == IN_MANIFEST && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_PACKAGE;
-    self->tempItemStore.close();
+    if (!self->inMemoryMode) {
+      self->tempItemStore.close();
+    }
     return;
   }
 

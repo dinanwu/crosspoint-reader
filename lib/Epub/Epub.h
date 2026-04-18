@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Print.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <memory>
 #include <string>
@@ -29,19 +31,25 @@ class Epub {
   std::unique_ptr<CssParser> cssParser;
   // CSS files
   std::vector<std::string> cssFiles;
+  // Guards bookMetadataCache and cssParser during the Phase 2 swap. Reader getters
+  // take the mutex for the duration of a single getSpineEntry/getTocEntry call; the
+  // background index task only takes it briefly during the final reset().
+  SemaphoreHandle_t cacheMutex = nullptr;
 
   bool findContentOpfFile(std::string* contentOpfFile) const;
-  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata);
-  bool parseTocNcxFile() const;
-  bool parseTocNavFile() const;
+  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, BookMetadataCache* targetCache = nullptr,
+                       bool inMemoryMode = false, std::vector<std::string>* outSpineHrefs = nullptr);
+  bool parseTocNcxFile(BookMetadataCache* targetCache = nullptr) const;
+  bool parseTocNavFile(BookMetadataCache* targetCache = nullptr) const;
   void parseCssFiles() const;
 
  public:
-  explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
+  explicit Epub(std::string filepath, const std::string& cacheDir)
+      : filepath(std::move(filepath)), cacheMutex(xSemaphoreCreateRecursiveMutex()) {
     // create a cache key based on the filepath
     cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));
   }
-  ~Epub() = default;
+  ~Epub();
   std::string& getBasePath() { return contentBasePath; }
   bool load(bool buildIfMissing = true, bool skipLoadingCss = false);
   bool clearCache() const;
@@ -73,4 +81,17 @@ class Epub {
   float calculateProgress(int currentSpineIndex, float currentSpineRead) const;
   CssParser* getCssParser() const { return cssParser.get(); }
   int resolveHrefToSpineIndex(const std::string& href) const;
+
+  // Returns true while the in-memory minimal cache is live and the full book.bin
+  // is still being built by the BookIndexService. Reader getters degrade silently
+  // (empty TOC entries, cumulativeSize=0) in this state.
+  bool isCacheMinimal() const;
+
+  // Runs the full SD-backed metadata cache build (OPF re-parse, TOC parse,
+  // buildBookBin) and swaps the resulting disk-backed cache in under cacheMutex.
+  // Called only from the BookIndexService task. `shouldAbort` is polled at phase
+  // boundaries so the service can stop the build early; pass nullptr to run
+  // uninterruptibly. Returns true on success; on failure the minimal cache
+  // remains in place.
+  bool runBackgroundCacheBuild(bool (*shouldAbort)(void*) = nullptr, void* shouldAbortCtx = nullptr);
 };

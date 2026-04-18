@@ -13,6 +13,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/BookIndexService.h"
 #include "network/SubscriptionSyncService.h"
 
 // Internal constants
@@ -784,6 +785,19 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
                         Rect{metrics.statusBarHorizontalMargin + orientedMarginLeft + 1, textY, metrics.batteryWidth,
                              metrics.batteryHeight},
                         showBatteryPercentage);
+  }
+
+  // Indexing indicator: small label shown to the right of the battery while the
+  // BookIndexService is finishing the background cache build. Mirrors the "SYNC"
+  // indicator pattern from drawHeader. Disappears on its own when the service
+  // flips to idle after the atomic book.bin rename.
+  if (BookIndexService::instance().isRunning()) {
+    const char* idxLabel = tr(STR_INDEXING);
+    const int batteryEndX = metrics.statusBarHorizontalMargin + orientedMarginLeft + 1 +
+                            (SETTINGS.statusBarBattery ? metrics.batteryWidth : 0);
+    const int batteryPercentWidth = (SETTINGS.statusBarBattery && showBatteryPercentage) ? 36 : 0;
+    constexpr int idxPadding = 12;
+    renderer.drawText(SMALL_FONT_ID, batteryEndX + batteryPercentWidth + idxPadding, textY, idxLabel);
   }
 
   // Draw Title

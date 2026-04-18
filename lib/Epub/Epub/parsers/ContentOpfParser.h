@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <unordered_map>
 #include <vector>
 
 #include "Epub.h"
@@ -29,7 +30,11 @@ class ContentOpfParser final : public Print {
   XML_Parser parser = nullptr;
   ParserState state = START;
   BookMetadataCache* cache;
+  // When true, the manifest/spine are resolved entirely in RAM (see inMemoryItemMap,
+  // inMemorySpineHrefs). tempItemStore stays closed and no .items.bin file is written.
+  bool inMemoryMode;
   FsFile tempItemStore;
+  std::unordered_map<std::string, std::string> inMemoryItemMap;  // idref → href, used only in inMemoryMode
   std::string coverItemId;
 
   // Index for fast idref→href lookup (used only for large EPUBs)
@@ -41,7 +46,10 @@ class ContentOpfParser final : public Print {
   std::deque<ItemIndexEntry> itemIndex;
   bool useItemIndex = false;
 
-  static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
+  // Always use the sorted idref index + binary search for spine resolution. The fallback
+  // linear-scan of .items.bin is O(n²) on SD (200ms per item at 1500 items per the inline
+  // comment at the fallback site); the sorted index is cheaper at every scale.
+  static constexpr uint16_t LARGE_SPINE_THRESHOLD = 0;
 
   // FNV-1a hash function
   static uint32_t fnvHash(const std::string& s) {
@@ -68,9 +76,17 @@ class ContentOpfParser final : public Print {
   std::string textReferenceHref;
   std::vector<std::string> cssFiles;  // CSS stylesheet paths
 
+  // In-memory output: populated when inMemoryMode is true, in manifest/spine order.
+  // Caller moves this into BookMetadataCache::becomeMinimal() after parsing.
+  std::vector<std::string> inMemorySpineHrefs;
+
   explicit ContentOpfParser(const std::string& cachePath, const std::string& baseContentPath, const size_t xmlSize,
-                            BookMetadataCache* cache)
-      : cachePath(cachePath), baseContentPath(baseContentPath), remainingSize(xmlSize), cache(cache) {}
+                            BookMetadataCache* cache, const bool inMemoryMode = false)
+      : cachePath(cachePath),
+        baseContentPath(baseContentPath),
+        remainingSize(xmlSize),
+        cache(cache),
+        inMemoryMode(inMemoryMode) {}
   ~ContentOpfParser() override;
 
   bool setup();

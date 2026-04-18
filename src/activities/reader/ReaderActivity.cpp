@@ -30,6 +30,11 @@ std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
 
   auto epub = std::unique_ptr<Epub>(new Epub(path, "/.crosspoint"));
   if (epub->load(true, SETTINGS.embeddedStyle == 0)) {
+    // Background indexer is kicked off by EpubReaderActivity after the first
+    // page has been rendered. Starting it here races with the foreground's
+    // section-0 build: both tasks hammer the heap (expat + std::string
+    // allocations), and on the 380KB ESP32-C3 the concurrent pressure caused
+    // operator new to abort mid-parse.
     return epub;
   }
 

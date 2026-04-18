@@ -342,6 +342,13 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   if (!series.etag.empty() && it != state_.seriesEtags.end() && it->second == series.etag &&
       Storage.exists(destPath.c_str())) {
     LOG_DBG("SUB", "Series '%s' unchanged by index etag, skipping", series.id.c_str());
+    // Backfill metadata for pre-existing series missing from seriesMeta (e.g. users
+    // upgrading from state format v1, where seriesEtags existed but seriesMeta did
+    // not). Without this, such series would stay invisible in the inbox until the
+    // server changed their etag.
+    if (state_.seriesMeta.find(series.id) == state_.seriesMeta.end()) {
+      populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
+    }
     return true;
   }
 
@@ -425,9 +432,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
 
   // Seed at 0 on first download (never overwrite an existing sidecar — the reader
   // owns it after that). A fresh subscribe reports every chapter as unread so the
-  // inbox surfaces it under "New chapters". The reader suppresses the break page
-  // for watermark == 0 (first-ever open), so users don't hit a "N new chapters"
-  // interstitial before they've read anything.
+  // inbox surfaces it under "New chapters" with a full unread-count badge.
   const std::string watermarkPath = cachePath + "/sub_watermark.bin";
   if (!Storage.exists(watermarkPath.c_str())) {
     if (SubscriptionState::writeWatermark(destPath, 0)) {

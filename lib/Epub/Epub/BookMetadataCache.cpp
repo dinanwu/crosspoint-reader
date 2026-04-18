@@ -400,6 +400,16 @@ bool BookMetadataCache::load() {
   return true;
 }
 
+void BookMetadataCache::becomeMinimal(std::vector<SpineEntry> spine, BookMetadata metadata) {
+  memSpine = std::move(spine);
+  coreMetadata = std::move(metadata);
+  spineCount = static_cast<uint16_t>(memSpine.size());
+  tocCount = 0;
+  minimalMode = true;
+  loaded = true;
+  LOG_DBG("BMC", "Minimal cache ready: %d spine entries (TOC deferred)", spineCount);
+}
+
 BookMetadataCache::SpineEntry BookMetadataCache::getSpineEntry(const int index) {
   if (!loaded) {
     LOG_ERR("BMC", "getSpineEntry called but cache not loaded");
@@ -409,6 +419,10 @@ BookMetadataCache::SpineEntry BookMetadataCache::getSpineEntry(const int index) 
   if (index < 0 || index >= static_cast<int>(spineCount)) {
     LOG_ERR("BMC", "getSpineEntry index %d out of range", index);
     return {};
+  }
+
+  if (minimalMode) {
+    return memSpine[index];
   }
 
   // Seek to spine LUT item, read from LUT and get out data
@@ -422,6 +436,10 @@ BookMetadataCache::SpineEntry BookMetadataCache::getSpineEntry(const int index) 
 BookMetadataCache::TocEntry BookMetadataCache::getTocEntry(const int index) {
   if (!loaded) {
     LOG_ERR("BMC", "getTocEntry called but cache not loaded");
+    return {};
+  }
+
+  if (minimalMode) {
     return {};
   }
 

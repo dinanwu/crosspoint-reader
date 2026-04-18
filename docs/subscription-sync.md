@@ -199,9 +199,9 @@ Why no interval gate: `HalPowerManager::startDeepSleep` fully powers off the RTC
 
 ### Per-series sidecar
 
-`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book and skips the break page.
+`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book.
 
-Seeded by the syncer on first download at `0` (so a fresh subscribe reports every chapter as unread and the inbox shows the series under "New chapters"). The reader suppresses the break page when `watermark == 0` to avoid greeting the user with an interstitial on first open. Updated by `EpubReaderActivity::onExit` to the current spine count, at which point subsequent sync additions become genuine "new chapter" deltas that do trigger the break page. The syncer never touches an existing sidecar, so re-downloading a series preserves the user's read watermark.
+Seeded by the syncer on first download at `0` (so a fresh subscribe reports every chapter as unread and the inbox shows the series under "New chapters"). Updated by `EpubReaderActivity::onExit` to the current spine count, after which subsequent sync additions show up as a nonzero unread-count badge on the inbox row. The syncer never touches an existing sidecar, so re-downloading a series preserves the user's read watermark.
 
 ### Global sync state
 

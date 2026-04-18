@@ -12,6 +12,38 @@
 #include "Epub/parsers/TocNavParser.h"
 #include "Epub/parsers/TocNcxParser.h"
 
+namespace {
+// Scoped recursive lock over the Epub cacheMutex. Recursive so that getter
+// delegation (e.g. getTocIndexForSpineIndex → getSpineItem) doesn't self-deadlock.
+struct ScopedCacheLock {
+  SemaphoreHandle_t mutex;
+  explicit ScopedCacheLock(SemaphoreHandle_t m) : mutex(m) {
+    if (mutex) xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+  }
+  ~ScopedCacheLock() {
+    if (mutex) xSemaphoreGiveRecursive(mutex);
+  }
+  ScopedCacheLock(const ScopedCacheLock&) = delete;
+  ScopedCacheLock& operator=(const ScopedCacheLock&) = delete;
+};
+}  // namespace
+
+Epub::~Epub() {
+  // NOTE: The owning activity MUST call BookIndexService::cancelAndWait(this) in its
+  // onExit before the unique_ptr<Epub> goes out of scope. If a background build task
+  // is still running here, its next access into *this (parseContentOpf, mutex,
+  // member strings) will dereference freed memory.
+  if (cacheMutex) {
+    vSemaphoreDelete(cacheMutex);
+    cacheMutex = nullptr;
+  }
+}
+
+bool Epub::isCacheMinimal() const {
+  ScopedCacheLock lock(cacheMutex);
+  return bookMetadataCache && bookMetadataCache->isMinimal();
+}
+
 bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
   const auto containerPath = "META-INF/container.xml";
   size_t containerSize;
@@ -44,7 +76,8 @@ bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
   return true;
 }
 
-bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
+bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, BookMetadataCache* targetCache,
+                           bool inMemoryMode, std::vector<std::string>* outSpineHrefs) {
   std::string contentOpfFilePath;
   if (!findContentOpfFile(&contentOpfFilePath)) {
     LOG_ERR("EBP", "Could not find content.opf in zip");
@@ -61,7 +94,9 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
     return false;
   }
 
-  ContentOpfParser opfParser(getCachePath(), getBasePath(), contentOpfSize, bookMetadataCache.get());
+  BookMetadataCache* cacheForParser = targetCache ? targetCache : bookMetadataCache.get();
+  ContentOpfParser opfParser(getCachePath(), getBasePath(), contentOpfSize, inMemoryMode ? nullptr : cacheForParser,
+                             inMemoryMode);
   if (!opfParser.setup()) {
     LOG_ERR("EBP", "Could not setup content.opf parser");
     return false;
@@ -136,11 +171,15 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
     cssFiles = opfParser.cssFiles;
   }
 
+  if (inMemoryMode && outSpineHrefs) {
+    *outSpineHrefs = std::move(opfParser.inMemorySpineHrefs);
+  }
+
   LOG_DBG("EBP", "Successfully parsed content.opf");
   return true;
 }
 
-bool Epub::parseTocNcxFile() const {
+bool Epub::parseTocNcxFile(BookMetadataCache* targetCache) const {
   // the ncx file should have been specified in the content.opf file
   if (tocNcxItem.empty()) {
     LOG_DBG("EBP", "No ncx file specified");
@@ -162,7 +201,8 @@ bool Epub::parseTocNcxFile() const {
   }
   const auto ncxSize = tempNcxFile.size();
 
-  TocNcxParser ncxParser(contentBasePath, ncxSize, bookMetadataCache.get());
+  BookMetadataCache* cacheForNcxParser = targetCache ? targetCache : bookMetadataCache.get();
+  TocNcxParser ncxParser(contentBasePath, ncxSize, cacheForNcxParser);
 
   if (!ncxParser.setup()) {
     LOG_ERR("EBP", "Could not setup toc ncx parser");
@@ -196,7 +236,7 @@ bool Epub::parseTocNcxFile() const {
   return true;
 }
 
-bool Epub::parseTocNavFile() const {
+bool Epub::parseTocNavFile(BookMetadataCache* targetCache) const {
   // the nav file should have been specified in the content.opf file (EPUB 3)
   if (tocNavItem.empty()) {
     LOG_DBG("EBP", "No nav file specified");
@@ -221,7 +261,8 @@ bool Epub::parseTocNavFile() const {
   // Note: We can't use `contentBasePath` here as the nav file may be in a different folder to the content.opf
   // and the HTMLX nav file will have hrefs relative to itself
   const std::string navContentBasePath = tocNavItem.substr(0, tocNavItem.find_last_of('/') + 1);
-  TocNavParser navParser(navContentBasePath, navSize, bookMetadataCache.get());
+  BookMetadataCache* cacheForNavParser = targetCache ? targetCache : bookMetadataCache.get();
+  TocNavParser navParser(navContentBasePath, navSize, cacheForNavParser);
 
   if (!navParser.setup()) {
     LOG_ERR("EBP", "Could not setup toc nav parser");
@@ -368,100 +409,105 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     return false;
   }
 
-  // Cache doesn't exist or is invalid, build it
-  LOG_DBG("EBP", "Cache not found, building spine/TOC cache");
+  // Cache doesn't exist or is invalid. Fast path: parse content.opf entirely in RAM
+  // and populate a minimal cache so the reader can render page 0 within ~2s. The
+  // owning activity starts BookIndexService after load() returns; that task runs the
+  // full SD-backed build (see runBackgroundCacheBuild) and swaps in a disk-backed
+  // cache when done.
+  LOG_DBG("EBP", "Cache not found, taking fast path (minimal in-RAM spine)");
   setupCacheDir();
 
-  const uint32_t indexingStart = millis();
-
-  // Begin building cache - stream entries to disk immediately
-  if (!bookMetadataCache->beginWrite()) {
-    LOG_ERR("EBP", "Could not begin writing cache");
-    return false;
-  }
-
-  // OPF Pass
-  const uint32_t opfStart = millis();
+  const uint32_t fastPathStart = millis();
   BookMetadataCache::BookMetadata bookMetadata;
-  if (!bookMetadataCache->beginContentOpfPass()) {
-    LOG_ERR("EBP", "Could not begin writing content.opf pass");
-    return false;
-  }
-  if (!parseContentOpf(bookMetadata)) {
-    LOG_ERR("EBP", "Could not parse content.opf");
-    return false;
-  }
-  if (!bookMetadataCache->endContentOpfPass()) {
-    LOG_ERR("EBP", "Could not end writing content.opf pass");
-    return false;
-  }
-  LOG_DBG("EBP", "OPF pass completed in %lu ms", millis() - opfStart);
-
-  // TOC Pass - try EPUB 3 nav first, fall back to NCX
-  const uint32_t tocStart = millis();
-  if (!bookMetadataCache->beginTocPass()) {
-    LOG_ERR("EBP", "Could not begin writing toc pass");
+  std::vector<std::string> spineHrefs;
+  if (!parseContentOpf(bookMetadata, nullptr, /*inMemoryMode=*/true, &spineHrefs)) {
+    LOG_ERR("EBP", "Fast-path OPF parse failed");
     return false;
   }
 
-  bool tocParsed = false;
-
-  // Try EPUB 3 nav document first (preferred)
-  if (!tocNavItem.empty()) {
-    LOG_DBG("EBP", "Attempting to parse EPUB 3 nav document");
-    tocParsed = parseTocNavFile();
+  std::vector<BookMetadataCache::SpineEntry> spineEntries;
+  spineEntries.reserve(spineHrefs.size());
+  for (auto& href : spineHrefs) {
+    spineEntries.emplace_back(std::move(href), /*cumulativeSize=*/0, /*tocIndex=*/-1);
   }
-
-  // Fall back to NCX if nav parsing failed or wasn't available
-  if (!tocParsed && !tocNcxItem.empty()) {
-    LOG_DBG("EBP", "Falling back to NCX TOC");
-    tocParsed = parseTocNcxFile();
-  }
-
-  if (!tocParsed) {
-    LOG_ERR("EBP", "Warning: Could not parse any TOC format");
-    // Continue anyway - book will work without TOC
-  }
-
-  if (!bookMetadataCache->endTocPass()) {
-    LOG_ERR("EBP", "Could not end writing toc pass");
-    return false;
-  }
-  LOG_DBG("EBP", "TOC pass completed in %lu ms", millis() - tocStart);
-
-  // Close the cache files
-  if (!bookMetadataCache->endWrite()) {
-    LOG_ERR("EBP", "Could not end writing cache");
-    return false;
-  }
-
-  // Build final book.bin
-  const uint32_t buildStart = millis();
-  if (!bookMetadataCache->buildBookBin(filepath, bookMetadata)) {
-    LOG_ERR("EBP", "Could not update mappings and sizes");
-    return false;
-  }
-  LOG_DBG("EBP", "buildBookBin completed in %lu ms", millis() - buildStart);
-  LOG_DBG("EBP", "Total indexing completed in %lu ms", millis() - indexingStart);
-
-  if (!bookMetadataCache->cleanupTmpFiles()) {
-    LOG_DBG("EBP", "Could not cleanup tmp files - ignoring");
-  }
-
-  // Reload the cache from disk so it's in the correct state
-  bookMetadataCache.reset(new BookMetadataCache(cachePath));
-  if (!bookMetadataCache->load()) {
-    LOG_ERR("EBP", "Failed to reload cache after writing");
-    return false;
-  }
-
-  if (!skipLoadingCss) {
-    // Parse CSS files after cache reload
-    parseCssFiles();
-    Storage.removeDir((cachePath + "/sections").c_str());
-  }
-
+  bookMetadataCache->becomeMinimal(std::move(spineEntries), bookMetadata);
+  LOG_DBG("EBP", "Fast path ready in %lu ms — deferring TOC/sizes/CSS to background",
+          millis() - fastPathStart);
   LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
+  return true;
+}
+
+bool Epub::runBackgroundCacheBuild(bool (*shouldAbort)(void*), void* shouldAbortCtx) {
+  LOG_DBG("EBP", "Background cache build starting");
+  const uint32_t start = millis();
+
+  // Build to a fresh cache instance — don't touch the live bookMetadataCache until
+  // we've successfully written book.bin and reloaded from disk.
+  auto buildCache = std::unique_ptr<BookMetadataCache>(new BookMetadataCache(cachePath));
+
+  if (!buildCache->beginWrite()) return false;
+
+  BookMetadataCache::BookMetadata bookMetadata;
+  if (!buildCache->beginContentOpfPass()) return false;
+  if (!parseContentOpf(bookMetadata, buildCache.get())) {
+    LOG_ERR("EBP", "Background OPF parse failed");
+    return false;
+  }
+  if (!buildCache->endContentOpfPass()) return false;
+
+  if (shouldAbort && shouldAbort(shouldAbortCtx)) {
+    LOG_DBG("EBP", "Background build aborted after OPF pass");
+    return false;
+  }
+
+  if (!buildCache->beginTocPass()) return false;
+  bool tocParsed = false;
+  if (!tocNavItem.empty()) {
+    tocParsed = parseTocNavFile(buildCache.get());
+  }
+  if (!tocParsed && !tocNcxItem.empty()) {
+    tocParsed = parseTocNcxFile(buildCache.get());
+  }
+  if (!tocParsed) {
+    LOG_DBG("EBP", "Warning: could not parse any TOC format during background build");
+  }
+  if (!buildCache->endTocPass()) return false;
+
+  if (shouldAbort && shouldAbort(shouldAbortCtx)) {
+    LOG_DBG("EBP", "Background build aborted after TOC pass");
+    return false;
+  }
+
+  if (!buildCache->endWrite()) return false;
+  if (!buildCache->buildBookBin(filepath, bookMetadata)) {
+    LOG_ERR("EBP", "Background buildBookBin failed");
+    return false;
+  }
+  buildCache->cleanupTmpFiles();
+
+  if (shouldAbort && shouldAbort(shouldAbortCtx)) {
+    LOG_DBG("EBP", "Background build aborted after buildBookBin (book.bin already written)");
+    return false;
+  }
+
+  // Reload the freshly-written book.bin into a new cache instance, then swap it in
+  // under cacheMutex so reader getters see a consistent pointer at all times.
+  auto diskCache = std::unique_ptr<BookMetadataCache>(new BookMetadataCache(cachePath));
+  if (!diskCache->load()) {
+    LOG_ERR("EBP", "Failed to reload cache after background build");
+    return false;
+  }
+
+  {
+    ScopedCacheLock lock(cacheMutex);
+    bookMetadataCache = std::move(diskCache);
+  }
+
+  // CSS parsing intentionally deferred to next book open. Running it here would
+  // race with the reader's getCssParser() calls during active rendering; the
+  // existing load() fast-path at line ~349 will build the CSS cache on next open
+  // and invalidate the section cache at that time.
+  LOG_DBG("EBP", "Background cache build completed in %lu ms", millis() - start);
   return true;
 }
 
@@ -745,6 +791,7 @@ bool Epub::getItemSize(const std::string& itemHref, size_t* size) const {
 }
 
 int Epub::getSpineItemsCount() const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     return 0;
   }
@@ -754,6 +801,7 @@ int Epub::getSpineItemsCount() const {
 size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const { return getSpineItem(spineIndex).cumulativeSize; }
 
 BookMetadataCache::SpineEntry Epub::getSpineItem(const int spineIndex) const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     LOG_ERR("EBP", "getSpineItem called but cache not loaded");
     return {};
@@ -768,6 +816,7 @@ BookMetadataCache::SpineEntry Epub::getSpineItem(const int spineIndex) const {
 }
 
 BookMetadataCache::TocEntry Epub::getTocItem(const int tocIndex) const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     LOG_DBG("EBP", "getTocItem called but cache not loaded");
     return {};
@@ -782,6 +831,7 @@ BookMetadataCache::TocEntry Epub::getTocItem(const int tocIndex) const {
 }
 
 int Epub::getTocItemsCount() const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     return 0;
   }
@@ -791,6 +841,7 @@ int Epub::getTocItemsCount() const {
 
 // work out the section index for a toc index
 int Epub::getSpineIndexForTocIndex(const int tocIndex) const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     LOG_ERR("EBP", "getSpineIndexForTocIndex called but cache not loaded");
     return 0;
@@ -813,6 +864,7 @@ int Epub::getSpineIndexForTocIndex(const int tocIndex) const {
 int Epub::getTocIndexForSpineIndex(const int spineIndex) const { return getSpineItem(spineIndex).tocIndex; }
 
 size_t Epub::getBookSize() const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded() || bookMetadataCache->getSpineCount() == 0) {
     return 0;
   }
@@ -820,6 +872,7 @@ size_t Epub::getBookSize() const {
 }
 
 int Epub::getSpineIndexForTextReference() const {
+  ScopedCacheLock lock(cacheMutex);
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
     LOG_ERR("EBP", "getSpineIndexForTextReference called but cache not loaded");
     return 0;

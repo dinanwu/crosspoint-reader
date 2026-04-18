@@ -9,8 +9,9 @@
 
 // List of subscribed EPUBs with unread new chapters. Populated from
 // SubscriptionState + per-book watermark sidecars. Opening a row goes to
-// EpubReaderActivity via the normal path — the reader resumes at saved
-// progress and surfaces the break page when the user walks into new chapters.
+// EpubReaderActivity via the normal path — the reader resumes at saved progress.
+// The unread-count badge on each row is the sole UI surface for "new chapters";
+// the reader no longer shows a break-page interstitial.
 class SubscriptionsInboxActivity final : public Activity {
  public:
   explicit SubscriptionsInboxActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)

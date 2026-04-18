@@ -2,6 +2,7 @@
 
 #include <HalPowerManager.h>
 
+#include "../network/BookIndexService.h"
 #include "../network/SubscriptionSyncService.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
@@ -223,6 +224,7 @@ void ActivityManager::popActivity() {
 
 bool ActivityManager::preventAutoSleep() const {
   if (SubscriptionSyncService::instance().isRunning()) return true;
+  if (BookIndexService::instance().isRunning()) return true;
   return currentActivity && currentActivity->preventAutoSleep();
 }
 
