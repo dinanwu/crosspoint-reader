@@ -139,7 +139,8 @@ void BaseTheme::drawProgressBar(const GfxRenderer& renderer, Rect rect, const si
 }
 
 void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                const char* btn4) const {
+                                const char* btn4, const char* sub1, const char* sub2, const char* sub3,
+                                const char* sub4) const {
   const GfxRenderer::Orientation orig_orientation = renderer.getOrientation();
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
@@ -148,11 +149,13 @@ void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   constexpr int buttonHeight = BaseMetrics::values.buttonHintsHeight;
   constexpr int buttonY = BaseMetrics::values.buttonHintsHeight;  // Distance from bottom
   constexpr int textYOffset = 7;                                  // Distance from top of button to text baseline
+  constexpr int subtitleYOffset = 23;                             // Subtitle sits below the main label
   // X3 has wider screen in portrait (528 vs 480), use more spacing
   constexpr int x4ButtonPositions[] = {25, 130, 245, 350};
   constexpr int x3ButtonPositions[] = {38, 154, 268, 384};
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
   const char* labels[] = {btn1, btn2, btn3, btn4};
+  const char* subtitles[] = {sub1, sub2, sub3, sub4};
 
   for (int i = 0; i < 4; i++) {
     // Only draw if the label is non-empty
@@ -163,6 +166,12 @@ void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
       const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
       renderer.drawText(UI_10_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+
+      if (subtitles[i] != nullptr && subtitles[i][0] != '\0') {
+        const int subWidth = renderer.getTextWidth(SMALL_FONT_ID, subtitles[i]);
+        const int subX = x + (buttonWidth - 1 - subWidth) / 2;
+        renderer.drawText(SMALL_FONT_ID, subX, pageHeight - buttonY + subtitleYOffset, subtitles[i]);
+      }
     }
   }
 

@@ -112,8 +112,12 @@ class BaseTheme {
                                bool showPercentage = true) const;  // Left aligned (reader mode)
   virtual void drawBatteryRight(const GfxRenderer& renderer, Rect rect,
                                 bool showPercentage = true) const;  // Right aligned (UI headers)
+  // The optional sub* params render a smaller-font subtitle line beneath the main
+  // label, intended for long-press affordances (e.g. "Hold: Sync" below "Open").
+  // Pass nullptr to omit the subtitle for that slot.
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                               const char* btn4) const;
+                               const char* btn4, const char* sub1 = nullptr, const char* sub2 = nullptr,
+                               const char* sub3 = nullptr, const char* sub4 = nullptr) const;
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
   virtual void drawList(const GfxRenderer& renderer, Rect rect, int itemCount, int selectedIndex,
                         const std::function<std::string(int index)>& rowTitle,

@@ -315,7 +315,8 @@ void LyraTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, 
 }
 
 void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                const char* btn4) const {
+                                const char* btn4, const char* sub1, const char* sub2, const char* sub3,
+                                const char* sub4) const {
   const GfxRenderer::Orientation orig_orientation = renderer.getOrientation();
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
@@ -325,11 +326,13 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   constexpr int buttonHeight = LyraMetrics::values.buttonHintsHeight;
   constexpr int buttonY = LyraMetrics::values.buttonHintsHeight;  // Distance from bottom
   constexpr int textYOffset = 7;                                  // Distance from top of button to text baseline
+  constexpr int subtitleYOffset = 22;                             // Subtitle sits below the main label
   // X3 has wider screen in portrait (528 vs 480), use more spacing
   constexpr int x4ButtonPositions[] = {58, 146, 254, 342};
   constexpr int x3ButtonPositions[] = {65, 157, 291, 383};
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
   const char* labels[] = {btn1, btn2, btn3, btn4};
+  const char* subtitles[] = {sub1, sub2, sub3, sub4};
 
   for (int i = 0; i < 4; i++) {
     const int x = buttonPositions[i];
@@ -341,6 +344,12 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
       const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
       renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+
+      if (subtitles[i] != nullptr && subtitles[i][0] != '\0') {
+        const int subWidth = renderer.getTextWidth(SMALL_FONT_ID, subtitles[i]);
+        const int subX = x + (buttonWidth - 1 - subWidth) / 2;
+        renderer.drawText(SMALL_FONT_ID, subX, pageHeight - buttonY + subtitleYOffset, subtitles[i]);
+      }
     } else {
       // Draw the filled background and border for a SMALL-sized button
       renderer.fillRoundedRect(x, pageHeight - smallButtonHeight, buttonWidth, smallButtonHeight, cornerRadius,

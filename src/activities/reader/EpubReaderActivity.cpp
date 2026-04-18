@@ -76,15 +76,21 @@ void EpubReaderActivity::onEnter() {
   // EPUB as a subscription series; the uint16_t value is the spine count at the last
   // onExit (i.e. what the user has seen).
   {
+    const std::string watermarkPath = epub->getCachePath() + "/sub_watermark.bin";
     FsFile wf;
-    if (Storage.openFileForRead("ERS", epub->getCachePath() + "/sub_watermark.bin", wf)) {
+    if (Storage.openFileForRead("ERS", watermarkPath, wf)) {
       uint8_t buf[2];
-      if (wf.read(buf, 2) == 2) {
+      const int n = wf.read(buf, 2);
+      if (n == 2) {
         isSubscription = true;
         watermarkSpineCount = buf[0] + (buf[1] << 8);
         LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
                 epub->getSpineItemsCount());
+      } else {
+        LOG_DBG("ERS", "sub_watermark.bin present but read %d bytes; isSubscription stays false", n);
       }
+    } else {
+      LOG_DBG("ERS", "No sub_watermark.bin at %s; isSubscription stays false", watermarkPath.c_str());
     }
   }
   // We may want a better condition to detect if we are opening for the first time.
@@ -117,12 +123,18 @@ void EpubReaderActivity::onExit() {
   // already carry the sidecar (i.e. those the syncer seeded).
   if (isSubscription && epub) {
     const uint16_t spineCount = static_cast<uint16_t>(epub->getSpineItemsCount());
+    const std::string watermarkPath = epub->getCachePath() + "/sub_watermark.bin";
     FsFile wf;
-    if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/sub_watermark.bin", wf)) {
+    if (Storage.openFileForWrite("ERS", watermarkPath, wf)) {
       const uint8_t buf[2] = {static_cast<uint8_t>(spineCount & 0xff), static_cast<uint8_t>((spineCount >> 8) & 0xff)};
       wf.write(buf, 2);
       wf.close();
+      LOG_DBG("ERS", "Watermark rewritten to %u at %s", spineCount, watermarkPath.c_str());
+    } else {
+      LOG_ERR("ERS", "Failed to open watermark for write at %s", watermarkPath.c_str());
     }
+  } else {
+    LOG_DBG("ERS", "Skipping watermark write: isSubscription=%d, epub=%d", isSubscription ? 1 : 0, epub ? 1 : 0);
   }
 
   APP_STATE.readerActivityLoadCount = 0;

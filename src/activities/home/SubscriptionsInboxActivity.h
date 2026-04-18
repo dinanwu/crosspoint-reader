@@ -31,6 +31,9 @@ class SubscriptionsInboxActivity final : public Activity {
   std::vector<Entry> entries;
   size_t selectorIndex = 0;
   bool configured = false;
+  // True once a long-press of Confirm has fired the sync, so the subsequent
+  // release doesn't also trigger the short-press Open action.
+  bool syncTriggeredByLongPress = false;
 
   void loadEntries();
 };

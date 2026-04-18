@@ -1,6 +1,6 @@
 # Subscription Sync — Server Contract
 
-**Status**: Draft design. Not yet implemented.
+**Status**: Implemented. See [Implementation pointers](#implementation-pointers) at the end for the on-device code.
 
 Defines the wire contract between the device (CrossPoint firmware) and an external server that scrapes web serials (Royal Road, etc.) and publishes them as EPUBs. The device polls the server on wake and downloads updated EPUBs so new chapters appear without manual sideloading.
 
@@ -11,9 +11,9 @@ Subscription management (adding/removing series) is handled entirely by the serv
 ## Architecture at a glance
 
 - Server runs a scheduled scraper, builds one EPUB per subscribed series, and exposes them over HTTPS.
-- Device syncs on wake (if interval elapsed) via a blocking `SubscriptionSyncActivity`. Activity downloads any changed EPUBs and hands off to home/reader.
+- Device syncs on every power-button wake via a blocking `SubscriptionSyncActivity` pushed on top of the home/reader dispatch. There is no device-side interval — the two-tier conditional-GET 304 path is the effective rate limit (a no-op sync finishes in ~1 s). See [Sync trigger](#sync-trigger) for why.
 - Device treats subscription EPUBs like any other EPUB — no new reader code, no new format on disk.
-- A small sidecar (`sub_watermark.bin`) stored beside progress.bin tracks "new since last open" for the break-page UX.
+- A small sidecar (`sub_watermark.bin`) stored beside `progress.bin` tracks "new since last open" for the break-page UX and drives the Subscriptions Inbox unread list.
 
 ---
 
@@ -41,6 +41,8 @@ GET /v1/subs/<series-id>.epub
 ```
 
 Series IDs must be source-prefixed (`royalroad-107917`, `scribblehub-98765`). This avoids collisions across sources and makes device-side filenames self-documenting.
+
+The device accepts full URLs pasted into the setting field and normalizes a trailing `/v1/subs/index.json` suffix + any trailing slashes away before use — users who copy the endpoint URL from these docs still get a valid base. See `SubscriptionSyncer::normalizeServerUrl`.
 
 ---
 
@@ -97,11 +99,13 @@ Server needs valid TLS for TLS to complete; any cert works. Let's Encrypt is fin
 | `series[].id` | string | Source-prefixed stable ID. Used as filename on device. |
 | `series[].title` | string | Display title. |
 | `series[].author` | string | Display author. |
-| `series[].url` | string | Relative path to the EPUB (device prefixes with server base). |
+| `series[].url` | string | Relative or absolute URL to the EPUB. Relative paths are joined against the configured server base. |
 | `series[].etag` | string | ETag of the EPUB resource. Lets device skip the conditional GET entirely if unchanged since last sync. |
 | `series[].size` | int (bytes) | For download progress bar. |
-| `series[].updatedAt` | unix seconds | Last time the EPUB was rebuilt. Used for "updated X ago" display. |
-| `series[].chapterCount` | int | Current chapter count. Lets device show "N new chapters" without parsing the EPUB. |
+| `series[].updatedAt` | unix seconds | Last time the EPUB was rebuilt. Advisory — not currently read by the device. |
+| `series[].chapterCount` | int | Current chapter count. Stored as `lastKnownSpineCount` so the inbox can show "N new chapters" without re-parsing the EPUB. When omitted (or `0`), the device falls back to parsing the downloaded EPUB — ~18 s for a 2 MB book on ESP32-C3. Servers SHOULD always send this. |
+
+`author` is consumed from the downloaded EPUB's OPF metadata, not from the index. `updatedAt` is reserved for future "updated X ago" display; servers SHOULD provide it for forward compatibility.
 
 The index endpoint itself must support conditional GET (see below). Device skips all per-series work on a `304`.
 
@@ -183,17 +187,55 @@ Only honor deletions if the top-level response is well-formed (`formatVersion ==
 
 ---
 
+## Sync trigger
+
+Sync runs on every `PowerButton` wake (see [src/main.cpp:310](../src/main.cpp)), not on a timed interval. The device also exposes a manual-sync entry point: a long-press of Confirm on the Subscriptions Inbox pushes `SubscriptionSyncActivity` directly.
+
+Why no interval gate: `HalPowerManager::startDeepSleep` fully powers off the RTC on this board, so `RTC_DATA_ATTR` variables do not survive deep sleep on battery — there is no reliable cross-sleep monotonic clock to schedule against. The 304 fast path on both the index and per-series endpoints makes the "sync on every wake" cost negligible when nothing has changed.
+
 ## Device-side sync state
 
-Per-series state (inside the book's existing cache directory):
+### Per-series sidecar
 
-- `sub_watermark.bin` in `.crosspoint/epub_<hash>/` — `uint16_t lastOpenedSpineCount` for the break-page feature. Its presence also marks "this EPUB is a subscription."
+`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book and skips the break page. Written on `EpubReaderActivity::onExit`.
 
-Global sync state:
+### Global sync state
 
-- `indexEtag` — ETag of the last successfully applied index.json. Persisted in SPIFFS settings.
-- `seriesEtags` — small JSON map of `{id: etag}` for per-series conditional GETs. Written atomically to `/.subscriptions/state.json` after every successful sync.
-- `lastSyncTick` — `RTC_DATA_ATTR uint64_t`. Survives deep sleep. Used for the "interval elapsed?" check at boot. Resets on full power loss (acceptable — next boot triggers a sync).
+Stored on the SD card at `/.subscriptions/state.json` (not SPIFFS — settings/state split avoids filling SPIFFS with dynamic content). JSON shape, `formatVersion: 2`:
+
+```json
+{
+  "formatVersion": 2,
+  "indexEtag": "W/\"...\"",
+  "seriesEtags": {
+    "royalroad-107917": "W/\"...\""
+  },
+  "seriesMeta": {
+    "royalroad-107917": {
+      "title": "Sky Pride",
+      "localPath": "/.subscriptions/royalroad-107917.epub",
+      "lastSyncedMs": 1712956800000,
+      "lastKnownSpineCount": 42
+    }
+  }
+}
+```
+
+- `indexEtag` — ETag of the last successfully applied `index.json`. Sent as `If-None-Match` on the next sync.
+- `seriesEtags` — per-series ETag map for conditional GETs on the EPUB endpoint.
+- `seriesMeta` — title, local path, last-sync timestamp, and spine count recorded at last successful sync. Drives the Subscriptions Inbox ("N new chapters") without opening each EPUB.
+
+`formatVersion: 1` state files (pre-`seriesMeta`) load in a best-effort way: ETags are preserved, `seriesMeta` is backfilled from the next successful download. The state file is written after every successful series download (so a crash mid-sync doesn't force re-downloads) and again during the `Cleaning` phase.
+
+### Settings
+
+User-visible settings, stored in the main `CrossPointSettings` blob:
+
+- `subscriptionsEnabled` — `uint8_t` toggle.
+- `subscriptionServerUrl` — `char[256]`. The server base URL.
+- `subscriptionBearerToken` — `char[128]`, marked obfuscated in the settings UI.
+
+All three are exposed both on the device settings activity and on the on-device settings web server (the `SETUP` button on the inbox launches it via File Transfer).
 
 ---
 
@@ -207,10 +249,27 @@ Global sync state:
 
 ## Open items
 
-Things to decide when building the server:
+Server-side decisions that don't affect the wire contract:
 
 - **EPUB generation library**: Python `ebooklib` is the obvious default; hand-rolled ZIP with OPF/nav.xhtml templates is also viable.
 - **Cover image dimensions**: recommend downsizing to ~400×600 grayscale before embedding. Verify device decode cost.
-- **Scrape scheduling**: server-side cron interval. Independent of device sync interval. Probably 30 min – 2 hr.
+- **Scrape scheduling**: server-side cron interval, independent of device wake cadence. Probably 30 min – 2 hr.
 - **Author note handling**: default "keep"; make server-side config.
-- **Per-chapter revision handling**: if an RR author edits a published chapter, does the server re-emit the EPUB with that chapter updated in place? Current invariants allow this (content of spine item N changes, index stays N). Confirm scraper behavior matches.
+- **Per-chapter revision handling**: if an RR author edits a published chapter, the server re-emits the EPUB with that chapter updated in place. The device's stable-index invariant allows this (content of spine item N changes, index stays N). The next sync downloads the replacement EPUB and the reader picks up the new content on next open of that spine item.
+
+---
+
+## Implementation pointers
+
+On-device code:
+
+| Concern | File |
+|---|---|
+| Sync state machine (wi-fi → NTP → index → downloads → cleanup) | [src/network/SubscriptionSyncer.{h,cpp}](../src/network/SubscriptionSyncer.h) |
+| Persistent state (`state.json` shape, watermark sidecar reads) | [src/network/SubscriptionState.{h,cpp}](../src/network/SubscriptionState.h) |
+| HTTP layer (bearer auth, conditional GET, ETag extraction) | [src/network/HttpDownloader.{h,cpp}](../src/network/HttpDownloader.h) |
+| Sync UI (blocking progress screen, cancel on Back) | [src/activities/network/SubscriptionSyncActivity.{h,cpp}](../src/activities/network/SubscriptionSyncActivity.h) |
+| Subscriptions Inbox (unread list, long-press manual sync) | [src/activities/home/SubscriptionsInboxActivity.{h,cpp}](../src/activities/home/SubscriptionsInboxActivity.h) |
+| Boot-path trigger on `PowerButton` wake | [src/main.cpp:310](../src/main.cpp) |
+| Break page + watermark write on reader exit | [src/activities/reader/EpubReaderActivity.{h,cpp}](../src/activities/reader/EpubReaderActivity.h) |
+| Settings fields | [src/CrossPointSettings.h:202](../src/CrossPointSettings.h), [src/SettingsList.h:124](../src/SettingsList.h) |

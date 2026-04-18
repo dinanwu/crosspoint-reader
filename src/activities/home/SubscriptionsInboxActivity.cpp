@@ -61,6 +61,7 @@ void SubscriptionsInboxActivity::loop() {
   const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, true);
 
   using Button = MappedInputManager::Button;
+  constexpr unsigned long LONG_PRESS_SYNC_MS = 1000;
 
   if (mappedInput.wasReleased(Button::Back)) {
     onGoHome();
@@ -76,15 +77,12 @@ void SubscriptionsInboxActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasReleased(Button::Confirm)) {
-    if (!entries.empty() && selectorIndex < entries.size()) {
-      onSelectBook(entries[selectorIndex].localPath);
-    }
-    return;
-  }
-
-  if (mappedInput.wasReleased(Button::Left)) {
-    // Manual sync. On return, refresh the inbox to pick up any new entries.
+  // Long-press Confirm triggers a manual sync. Latch so the upcoming release
+  // doesn't also fire short-press Open. startActivityForResult() tears us down
+  // and rebuilds on return, so the flag only needs to survive until release.
+  if (!syncTriggeredByLongPress && mappedInput.isPressed(Button::Confirm) &&
+      mappedInput.getHeldTime() >= LONG_PRESS_SYNC_MS) {
+    syncTriggeredByLongPress = true;
     startActivityForResult(std::make_unique<SubscriptionSyncActivity>(renderer, mappedInput),
                            [this](const ActivityResult&) {
                              loadEntries();
@@ -95,15 +93,24 @@ void SubscriptionsInboxActivity::loop() {
     return;
   }
 
-  // Navigation: side Up = previous, side Down or front Right = next.
-  // Left is reserved for Sync, so we use explicit button lists rather than
-  // ButtonNavigator::onPreviousRelease (which also listens to Left).
-  buttonNavigator.onRelease({Button::Up}, [this, listSize] {
+  if (mappedInput.wasReleased(Button::Confirm)) {
+    if (syncTriggeredByLongPress) {
+      syncTriggeredByLongPress = false;
+      return;
+    }
+    if (!entries.empty() && selectorIndex < entries.size()) {
+      onSelectBook(entries[selectorIndex].localPath);
+    }
+    return;
+  }
+
+  // Navigation: side Up / front Left = previous, side Down / front Right = next.
+  buttonNavigator.onPreviousRelease([this, listSize] {
     selectorIndex = ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize);
     requestUpdate();
   });
 
-  buttonNavigator.onContinuous({Button::Up}, [this, listSize, pageItems] {
+  buttonNavigator.onPreviousContinuous([this, listSize, pageItems] {
     selectorIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
     requestUpdate();
   });
@@ -153,18 +160,22 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   } else {
     GUI.drawList(
         renderer, Rect{0, contentTop, pageWidth, contentHeight}, entries.size(), selectorIndex,
-        [this](int index) { return entries[index].title; },
+        [this](int index) { return entries[index].title; }, nullptr,
+        [this](int index) { return UITheme::getFileIcon(entries[index].localPath); },
         [this](int index) {
-          char buf[32];
+          char buf[16];
           snprintf(buf, sizeof(buf), tr(STR_INBOX_UNREAD_COUNT), entries[index].unreadCount);
           return std::string(buf);
-        },
-        [this](int index) { return UITheme::getFileIcon(entries[index].localPath); });
+        });
   }
 
   const char* confirmLabel = entries.empty() ? "" : tr(STR_OPEN);
-  const auto labels = mappedInput.mapLabels(tr(STR_HOME), confirmLabel, tr(STR_SYNC_NOW), tr(STR_DIR_DOWN));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  const auto labels = mappedInput.mapLabels(tr(STR_HOME), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  // Long-press on Confirm triggers a manual sync; advertise it as a subtitle on the
+  // Open button so the affordance is discoverable without its own button slot.
+  const auto subtitles = mappedInput.mapLabels("", tr(STR_HOLD_TO_SYNC), "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, subtitles.btn1, subtitles.btn2,
+                      subtitles.btn3, subtitles.btn4);
 
   renderer.displayBuffer();
 }
