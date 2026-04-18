@@ -11,7 +11,9 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "WifiCredentialStore.h"
 #include "activities/ActivityManager.h"
+#include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/SubscriptionState.h"
@@ -99,6 +101,37 @@ void SubscriptionsInboxActivity::loadEntries() {
   });
 }
 
+void SubscriptionsInboxActivity::triggerSyncOrWifi() {
+  auto& syncService = SubscriptionSyncService::instance();
+  if (syncService.isRunning()) {
+    syncService.cancel();
+    requestUpdate();
+    return;
+  }
+  if (WIFI_STORE.getCredentials().empty()) {
+    // Skip the NoCredentials failure banner round-trip — route straight to Wi-Fi
+    // setup and auto-start sync on success so the user's intent is honored.
+    launchWifiSelection(/*startSyncOnSuccess=*/true);
+    return;
+  }
+  syncService.startIfIdle();
+  requestUpdate();
+}
+
+void SubscriptionsInboxActivity::launchWifiSelection(bool startSyncOnSuccess) {
+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                         [this, startSyncOnSuccess](const ActivityResult& result) {
+                           onWifiSelectionComplete(!result.isCancelled, startSyncOnSuccess);
+                         });
+}
+
+void SubscriptionsInboxActivity::onWifiSelectionComplete(bool connected, bool startSyncOnSuccess) {
+  if (connected && startSyncOnSuccess) {
+    SubscriptionSyncService::instance().startIfIdle();
+  }
+  requestUpdate();
+}
+
 void SubscriptionsInboxActivity::onEnter() {
   Activity::onEnter();
   configured = SETTINGS.subscriptionsEnabled && strlen(SETTINGS.subscriptionServerUrl) > 0 &&
@@ -157,12 +190,7 @@ void SubscriptionsInboxActivity::loop() {
   if (!syncTriggeredByLongPress && mappedInput.isPressed(Button::Confirm) &&
       mappedInput.getHeldTime() >= LONG_PRESS_SYNC_MS) {
     syncTriggeredByLongPress = true;
-    if (syncService.isRunning()) {
-      syncService.cancel();
-    } else {
-      syncService.startIfIdle();
-    }
-    requestUpdate();
+    triggerSyncOrWifi();
     return;
   }
 
@@ -176,12 +204,7 @@ void SubscriptionsInboxActivity::loop() {
     } else if (entries.empty()) {
       // With no books to open, Confirm is unambiguously the sync trigger — users
       // shouldn't have to discover the long-press affordance to get started.
-      if (syncService.isRunning()) {
-        syncService.cancel();
-      } else {
-        syncService.startIfIdle();
-      }
-      requestUpdate();
+      triggerSyncOrWifi();
     }
     return;
   }
@@ -305,11 +328,16 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
     return;
   }
 
+  const bool noWifiCreds = WIFI_STORE.getCredentials().empty();
+
   if (entries.empty()) {
-    // "No new chapters" is only correct if a sync has completed and found nothing
-    // new. On first boot (or after a wipe of state.json) entries is empty because
-    // nothing has ever synced — show a hint to trigger the first sync instead.
-    const char* msg = lastResult.finishedAtMs == 0 ? tr(STR_SUBS_NEVER_SYNCED) : tr(STR_SYNC_NO_CHANGES);
+    // Three states for the empty-list message:
+    //   - no Wi-Fi saved → route user to Wi-Fi setup first (sync would fail anyway)
+    //   - never synced  → "No subscriptions synced yet" (first-run hint)
+    //   - caught up     → "No new chapters"
+    const char* msg = noWifiCreds                   ? tr(STR_SUBS_NO_WIFI)
+                      : lastResult.finishedAtMs == 0 ? tr(STR_SUBS_NEVER_SYNCED)
+                                                     : tr(STR_SYNC_NO_CHANGES);
     renderer.drawCenteredText(UI_10_FONT_ID, contentTop + contentHeight / 2, msg);
   } else {
     // entries is sorted unread-first, so the split point is just after the last unread row.
@@ -362,14 +390,18 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
 
   // Confirm label depends on context:
   //   - non-empty list → short-press opens the selected book; subtitle hints long-press
-  //   - empty list + idle → short-press starts sync directly (unambiguous)
   //   - empty list + running → short-press cancels (unambiguous)
-  // Long-press still works everywhere as a convenience.
+  //   - empty list + no Wi-Fi → short-press opens Wi-Fi setup (unambiguous)
+  //   - empty list + idle + Wi-Fi saved → short-press starts sync directly
+  // Long-press still works everywhere as a convenience and auto-routes through
+  // Wi-Fi setup when credentials are missing.
   const char* confirmLabel;
   if (!entries.empty()) {
     confirmLabel = tr(STR_OPEN);
   } else if (syncRunning) {
     confirmLabel = tr(STR_CANCEL);
+  } else if (noWifiCreds) {
+    confirmLabel = tr(STR_WIFI_SETUP);
   } else {
     confirmLabel = tr(STR_SYNC_NOW);
   }
@@ -377,7 +409,9 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   // different from the short-press main label — otherwise it's redundant noise.
   const char* confirmSubtitle = "";
   if (!entries.empty()) {
-    confirmSubtitle = syncRunning ? tr(STR_HOLD_TO_CANCEL) : tr(STR_HOLD_TO_SYNC);
+    confirmSubtitle = syncRunning    ? tr(STR_HOLD_TO_CANCEL)
+                      : noWifiCreds  ? tr(STR_HOLD_TO_WIFI)
+                                     : tr(STR_HOLD_TO_SYNC);
   }
   const auto labels = mappedInput.mapLabels(tr(STR_HOME), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   const auto subtitles = mappedInput.mapLabels("", confirmSubtitle, "", "");

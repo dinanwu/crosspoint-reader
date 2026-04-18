@@ -41,4 +41,10 @@ class SubscriptionsInboxActivity final : public Activity {
   uint64_t lastSeenResultMs = 0;
 
   void loadEntries();
+  // Routes Confirm to either sync or Wi-Fi setup based on whether credentials
+  // are saved — saves the user one round-trip through a NoCredentials failure
+  // banner when they haven't connected yet.
+  void triggerSyncOrWifi();
+  void launchWifiSelection(bool startSyncOnSuccess);
+  void onWifiSelectionComplete(bool connected, bool startSyncOnSuccess);
 };

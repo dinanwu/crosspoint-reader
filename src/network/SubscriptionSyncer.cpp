@@ -144,6 +144,9 @@ void SubscriptionSyncer::tick() {
     case Phase::ConnectingWifi:
       if (!connectWifi()) {
         progress_.failure = FailureReason::WifiConnect;
+        // connectWifi() left the radio in STA mode; tear it down so a failed
+        // connect doesn't leak the Wi-Fi radio until next reboot.
+        teardownWifi();
         transitionTo(Phase::Failed);
         return;
       }
