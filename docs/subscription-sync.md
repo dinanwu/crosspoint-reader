@@ -11,9 +11,11 @@ Subscription management (adding/removing series) is handled entirely by the serv
 ## Architecture at a glance
 
 - Server runs a scheduled scraper, builds one EPUB per subscribed series, and exposes them over HTTPS.
-- Device syncs on every power-button wake via a blocking `SubscriptionSyncActivity` pushed on top of the home/reader dispatch. There is no device-side interval — the two-tier conditional-GET 304 path is the effective rate limit (a no-op sync finishes in ~1 s). See [Sync trigger](#sync-trigger) for why.
+- Device syncs on every power-button wake via a background FreeRTOS task owned by `SubscriptionSyncService`. The UI task never blocks; progress and results surface through the Subscriptions Inbox. There is no device-side interval — the two-tier conditional-GET 304 path is the effective rate limit (a no-op sync finishes in ~1 s). See [Sync trigger](#sync-trigger) for why.
 - Device treats subscription EPUBs like any other EPUB — no new reader code, no new format on disk.
 - A small sidecar (`sub_watermark.bin`) stored beside `progress.bin` tracks "new since last open" for the break-page UX and drives the Subscriptions Inbox unread list.
+
+For device-side implementation details (threading model, phase state machine, cache invalidation, reader integration, failure modes), see [subscription-sync-internals.md](./subscription-sync-internals.md).
 
 ---
 
@@ -189,7 +191,7 @@ Only honor deletions if the top-level response is well-formed (`formatVersion ==
 
 ## Sync trigger
 
-Sync runs on every `PowerButton` wake (see [src/main.cpp:310](../src/main.cpp)), not on a timed interval. The device also exposes a manual-sync entry point: a long-press of Confirm on the Subscriptions Inbox pushes `SubscriptionSyncActivity` directly.
+Sync runs on every `PowerButton` wake (see [src/main.cpp:310](../src/main.cpp)), not on a timed interval. The trigger is a single call to `SubscriptionSyncService::instance().startIfIdle()`, which spawns the background task if preconditions pass (subscriptions enabled, URL and token configured, at least one stored Wi-Fi credential) and silently no-ops otherwise. The device also exposes a manual entry point: a long-press of Confirm on the Subscriptions Inbox calls the same `startIfIdle()` (or `cancel()` if a sync is already running).
 
 Why no interval gate: `HalPowerManager::startDeepSleep` fully powers off the RTC on this board, so `RTC_DATA_ATTR` variables do not survive deep sleep on battery — there is no reliable cross-sleep monotonic clock to schedule against. The 304 fast path on both the index and per-series endpoints makes the "sync on every wake" cost negligible when nothing has changed.
 
@@ -197,7 +199,9 @@ Why no interval gate: `HalPowerManager::startDeepSleep` fully powers off the RTC
 
 ### Per-series sidecar
 
-`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book and skips the break page. Written on `EpubReaderActivity::onExit`.
+`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book and skips the break page.
+
+Seeded by the syncer on first download at the current `chapterCount` (so a fresh subscribe shows 0 unread — next sync's additions become the first delta flagged as new). Updated by `EpubReaderActivity::onExit` to the current spine count. The syncer never touches an existing sidecar, so re-downloading a series preserves the user's read watermark.
 
 ### Global sync state
 
@@ -266,10 +270,14 @@ On-device code:
 | Concern | File |
 |---|---|
 | Sync state machine (wi-fi → NTP → index → downloads → cleanup) | [src/network/SubscriptionSyncer.{h,cpp}](../src/network/SubscriptionSyncer.h) |
-| Persistent state (`state.json` shape, watermark sidecar reads) | [src/network/SubscriptionState.{h,cpp}](../src/network/SubscriptionState.h) |
+| Background FreeRTOS task, progress snapshot, cancel routing | [src/network/SubscriptionSyncService.{h,cpp}](../src/network/SubscriptionSyncService.h) |
+| Persistent state (`state.json` shape, watermark sidecar reads/writes) | [src/network/SubscriptionState.{h,cpp}](../src/network/SubscriptionState.h) |
 | HTTP layer (bearer auth, conditional GET, ETag extraction) | [src/network/HttpDownloader.{h,cpp}](../src/network/HttpDownloader.h) |
-| Sync UI (blocking progress screen, cancel on Back) | [src/activities/network/SubscriptionSyncActivity.{h,cpp}](../src/activities/network/SubscriptionSyncActivity.h) |
-| Subscriptions Inbox (unread list, long-press manual sync) | [src/activities/home/SubscriptionsInboxActivity.{h,cpp}](../src/activities/home/SubscriptionsInboxActivity.h) |
+| Subscriptions Inbox (unread list, sync banner, long-press manual sync/cancel) | [src/activities/home/SubscriptionsInboxActivity.{h,cpp}](../src/activities/home/SubscriptionsInboxActivity.h) |
 | Boot-path trigger on `PowerButton` wake | [src/main.cpp:310](../src/main.cpp) |
-| Break page + watermark write on reader exit | [src/activities/reader/EpubReaderActivity.{h,cpp}](../src/activities/reader/EpubReaderActivity.h) |
-| Settings fields | [src/CrossPointSettings.h:202](../src/CrossPointSettings.h), [src/SettingsList.h:124](../src/SettingsList.h) |
+| Break page + watermark write on reader exit; auto-advance to next unread series | [src/activities/reader/EpubReaderActivity.{h,cpp}](../src/activities/reader/EpubReaderActivity.h) |
+| Auto-sleep inhibit while sync is running | [src/activities/ActivityManager.cpp:224-227](../src/activities/ActivityManager.cpp) |
+| Settings fields (enabled flag, server URL, bearer token) | [src/CrossPointSettings.h:202](../src/CrossPointSettings.h), [src/SettingsList.h:124](../src/SettingsList.h) |
+| Settings-web test endpoint | [src/network/CrossPointWebServer.cpp:1267](../src/network/CrossPointWebServer.cpp) |
+
+For a deep-dive into how these pieces fit together — threading, cache invalidation, cancellation latency, known concurrency hazards — see [subscription-sync-internals.md](./subscription-sync-internals.md).
