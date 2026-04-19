@@ -77,9 +77,8 @@ void EpubReaderActivity::onEnter() {
   // at book end depends on this signal being fresh per-open — reset before probing.
   isSubscription = false;
   watermarkSpineCount = 0;
-  if (SubscriptionState::isSubscription(epub->getPath())) {
-    isSubscription = true;
-    watermarkSpineCount = SubscriptionState::readWatermark(epub->getPath());
+  isSubscription = SubscriptionState::tryReadWatermark(epub->getPath(), watermarkSpineCount);
+  if (isSubscription) {
     LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
             epub->getSpineItemsCount());
   }
@@ -124,7 +123,9 @@ void EpubReaderActivity::onExit() {
     if (newWatermark == 0) {
       newWatermark = static_cast<uint16_t>(epub->getSpineItemsCount());
     }
-    if (SubscriptionState::writeWatermark(epub->getPath(), newWatermark)) {
+    if (newWatermark == watermarkSpineCount) {
+      LOG_DBG("ERS", "Watermark unchanged (%u), skipping write", newWatermark);
+    } else if (SubscriptionState::writeWatermark(epub->getPath(), newWatermark)) {
       LOG_DBG("ERS", "Watermark rewritten to %u", newWatermark);
     } else {
       LOG_ERR("ERS", "Failed to write watermark for %s", epub->getPath().c_str());

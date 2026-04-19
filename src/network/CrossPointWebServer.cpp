@@ -13,8 +13,10 @@
 #include "CrossPointSettings.h"
 #include "HttpDownloader.h"
 #include "SettingsList.h"
+#include "SubscriptionState.h"
 #include "SubscriptionSyncer.h"
 #include "WebDAVHandler.h"
+#include "util/UrlUtils.h"
 #include "html/FilesPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
@@ -1288,7 +1290,7 @@ void CrossPointWebServer::handleSubscriptionsTest() const {
   }
 
   url = SubscriptionSyncer::normalizeServerUrl(url);
-  const std::string fullUrl = url + "/v1/subs/index.json";
+  const std::string fullUrl = UrlUtils::buildUrl(url, SubscriptionState::INDEX_ENDPOINT);
 
   std::string body;
   const auto result = HttpDownloader::fetchConditional(fullUrl, body, token, "");

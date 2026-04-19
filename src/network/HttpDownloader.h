@@ -47,7 +47,6 @@ class HttpDownloader {
   struct HttpResult {
     int status = 0;
     std::string etag;
-    std::string lastModified;
   };
 
   /**

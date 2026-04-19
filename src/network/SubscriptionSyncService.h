@@ -26,6 +26,10 @@ class SubscriptionSyncService {
 
   bool isRunning() const { return running_.load(std::memory_order_acquire); }
 
+  // Lock-free accessor for UI polling. Monotonic per-run — advances once when
+  // each sync task exits. Zero until the first sync has ever finished.
+  uint64_t lastFinishedAtMs() const { return lastFinishedAtMs_.load(std::memory_order_acquire); }
+
   struct LastResult {
     SubscriptionSyncer::Phase phase = SubscriptionSyncer::Phase::Idle;
     SubscriptionSyncer::FailureReason failure = SubscriptionSyncer::FailureReason::None;
@@ -56,6 +60,7 @@ class SubscriptionSyncService {
   SubscriptionSyncer::Progress progress_;  // guarded by mutex_
   LastResult lastResult_;                  // guarded by mutex_
   std::atomic<bool> running_{false};
+  std::atomic<uint64_t> lastFinishedAtMs_{0};
   // Written only from the SubSync task (progress callback), read outside mutex.
   uint32_t lastPublishMs_ = 0;
   SemaphoreHandle_t mutex_ = nullptr;

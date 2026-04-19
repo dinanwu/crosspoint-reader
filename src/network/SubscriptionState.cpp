@@ -51,15 +51,22 @@ std::string SubscriptionState::watermarkPathForEpub(const std::string& epubPath)
 }
 
 uint16_t SubscriptionState::readWatermark(const std::string& epubPath) {
+  uint16_t value = 0;
+  tryReadWatermark(epubPath, value);
+  return value;
+}
+
+bool SubscriptionState::tryReadWatermark(const std::string& epubPath, uint16_t& out) {
   FsFile f;
   if (!Storage.openFileForRead("SUB", watermarkPathForEpub(epubPath), f)) {
-    return 0;
+    return false;
   }
   uint8_t buf[2] = {0, 0};
   const int n = f.read(buf, 2);
   f.close();
-  if (n != 2) return 0;
-  return static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+  if (n != 2) return false;
+  out = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+  return true;
 }
 
 bool SubscriptionState::writeWatermark(const std::string& epubPath, uint16_t spineCount) {

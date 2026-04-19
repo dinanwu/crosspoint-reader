@@ -139,7 +139,7 @@ void SubscriptionsInboxActivity::onEnter() {
     loadEntries();
   }
   // Prime so loop() reloads only when a *new* sync finishes while we're visible.
-  lastSeenResultMs = SubscriptionSyncService::instance().fullSnapshot().lastResult.finishedAtMs;
+  lastSeenResultMs = SubscriptionSyncService::instance().lastFinishedAtMs();
   selectorIndex = 0;
   requestUpdate();
 }
@@ -160,7 +160,7 @@ void SubscriptionsInboxActivity::loop() {
 
   // Pick up newly-downloaded series while the Inbox is still on screen —
   // finishedAtMs is the only monotonic signal for "a sync just sealed".
-  const uint64_t finishedAtMs = syncService.fullSnapshot().lastResult.finishedAtMs;
+  const uint64_t finishedAtMs = syncService.lastFinishedAtMs();
   if (finishedAtMs != 0 && finishedAtMs != lastSeenResultMs) {
     lastSeenResultMs = finishedAtMs;
     loadEntries();
@@ -324,10 +324,6 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   const bool noWifiCreds = WIFI_STORE.getCredentials().empty();
 
   if (entries.empty()) {
-    // Three states for the empty-list message:
-    //   - no Wi-Fi saved → route user to Wi-Fi setup first (sync would fail anyway)
-    //   - never synced  → "No subscriptions synced yet" (first-run hint)
-    //   - caught up     → "No new chapters"
     const char* msg = noWifiCreds                   ? tr(STR_SUBS_NO_WIFI)
                       : lastResult.finishedAtMs == 0 ? tr(STR_SUBS_NEVER_SYNCED)
                                                      : tr(STR_SYNC_NO_CHANGES);
@@ -381,13 +377,8 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
     }
   }
 
-  // Confirm label depends on context:
-  //   - non-empty list → short-press opens the selected book; subtitle hints long-press
-  //   - empty list + running → short-press cancels (unambiguous)
-  //   - empty list + no Wi-Fi → short-press opens Wi-Fi setup (unambiguous)
-  //   - empty list + idle + Wi-Fi saved → short-press starts sync directly
-  // Long-press still works everywhere as a convenience and auto-routes through
-  // Wi-Fi setup when credentials are missing.
+  // Short-press Confirm has different meanings depending on list + Wi-Fi state;
+  // long-press is always "sync now" (routed through Wi-Fi setup when creds missing).
   const char* confirmLabel;
   if (!entries.empty()) {
     confirmLabel = tr(STR_OPEN);
@@ -398,8 +389,7 @@ void SubscriptionsInboxActivity::render(RenderLock&&) {
   } else {
     confirmLabel = tr(STR_SYNC_NOW);
   }
-  // Subtitle advertises the long-press affordance, but only when it means something
-  // different from the short-press main label — otherwise it's redundant noise.
+  // Suppress the long-press subtitle when it would duplicate the short-press label.
   const char* confirmSubtitle = "";
   if (!entries.empty()) {
     confirmSubtitle = syncRunning    ? tr(STR_HOLD_TO_CANCEL)

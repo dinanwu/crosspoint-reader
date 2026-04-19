@@ -46,6 +46,10 @@ class SubscriptionState {
   // Returns 0 if the sidecar file is missing (never-opened book).
   static uint16_t readWatermark(const std::string& epubPath);
 
+  // Reads the watermark in one SD trip, distinguishing "absent" from "zero".
+  // Returns true if the sidecar exists (and fills *out*); false if missing.
+  static bool tryReadWatermark(const std::string& epubPath, uint16_t& out);
+
   // Writes the watermark sidecar. Creates the cache directory if missing, so this
   // is safe to call during first-download seeding before the book has been opened.
   static bool writeWatermark(const std::string& epubPath, uint16_t spineCount);

@@ -15,6 +15,7 @@
 #include "CrossPointSettings.h"
 #include "HttpDownloader.h"
 #include "WifiCredentialStore.h"
+#include "util/UrlUtils.h"
 
 namespace {
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -34,16 +35,6 @@ void syncTimeWithNTP() {
     vTaskDelay(100 / portTICK_PERIOD_MS);
     retry++;
   }
-}
-
-std::string joinUrl(const std::string& base, const std::string& path) {
-  if (base.empty()) return path;
-  if (path.empty()) return base;
-  const bool baseSlash = base.back() == '/';
-  const bool pathSlash = path.front() == '/';
-  if (baseSlash && pathSlash) return base + path.substr(1);
-  if (!baseSlash && !pathSlash) return base + "/" + path;
-  return base + path;
 }
 }  // namespace
 
@@ -70,8 +61,7 @@ bool SubscriptionSyncer::begin() {
   progress_ = Progress{};
   transitionTo(Phase::Idle);
 
-  // Clear all per-run transient state — a prior Cancelled/Failed run would
-  // otherwise leave abortRequested_ set and terminate the next run immediately.
+  // A prior Cancelled/Failed run would otherwise leave abortRequested_ set.
   abortRequested_ = false;
   indexUnchanged_ = false;
   seriesFromIndex_.clear();
@@ -128,8 +118,6 @@ void SubscriptionSyncer::tick() {
     case Phase::ConnectingWifi:
       if (!connectWifi()) {
         progress_.failure = FailureReason::WifiConnect;
-        // connectWifi() left the radio in STA mode; tear it down so a failed
-        // connect doesn't leak the Wi-Fi radio until next reboot.
         teardownWifi();
         transitionTo(Phase::Failed);
         return;
@@ -170,7 +158,6 @@ void SubscriptionSyncer::tick() {
       progress_.bytesTotal = seriesFromIndex_[seriesIndex_].size;
       if (!downloadCurrentSeries()) {
         teardownWifi();
-        // If the user aborted mid-download, land on Cancelled rather than Failed.
         transitionTo(abortRequested_ ? Phase::Cancelled : Phase::Failed);
         return;
       }
@@ -230,7 +217,7 @@ bool SubscriptionSyncer::connectWifi() {
 }
 
 bool SubscriptionSyncer::fetchAndParseIndex() {
-  const std::string url = joinUrl(serverUrl_, SubscriptionState::INDEX_ENDPOINT);
+  const std::string url = UrlUtils::buildUrl(serverUrl_, SubscriptionState::INDEX_ENDPOINT);
   std::string body;
 
   const auto result = HttpDownloader::fetchConditional(url, body, bearerToken_, state_.indexEtag);
@@ -309,7 +296,7 @@ bool SubscriptionSyncer::fetchAndParseIndex() {
 
 bool SubscriptionSyncer::downloadCurrentSeries() {
   const SeriesEntry& series = seriesFromIndex_[seriesIndex_];
-  const std::string url = joinUrl(serverUrl_, series.url);
+  const std::string url = UrlUtils::buildUrl(serverUrl_, series.url);
   const std::string destPath = SubscriptionState::epubPathForId(series.id);
   const std::string partPath = SubscriptionState::partPathForId(series.id);
 
@@ -366,8 +353,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
       return false;
     }
     LOG_ERR("SUB", "Series '%s' download failed: %d", series.id.c_str(), result.status);
-    progress_.failure =
-        (result.status >= 500 && result.status < 600) ? FailureReason::ServerError : FailureReason::IndexFetch;
+    progress_.failure = FailureReason::ServerError;
     return false;
   }
 

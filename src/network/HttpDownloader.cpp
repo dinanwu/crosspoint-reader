@@ -215,12 +215,8 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
     LOG_DBG("HTTP", "Content-Length: unknown");
   }
 
-  // Remove existing file if present
-  if (Storage.exists(destPath.c_str())) {
-    Storage.remove(destPath.c_str());
-  }
+  Storage.remove(destPath.c_str());
 
-  // Open file for writing
   FsFile file;
   if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
     LOG_ERR("HTTP", "Failed to open file for writing");
@@ -298,12 +294,8 @@ HttpDownloader::HttpResult fillResult(HTTPClient& http, int httpCode) {
   HttpDownloader::HttpResult result;
   result.status = httpCode;
   const String etag = http.header("ETag");
-  const String lastModified = http.header("Last-Modified");
   if (etag.length() > 0) {
     result.etag = etag.c_str();
-  }
-  if (lastModified.length() > 0) {
-    result.lastModified = lastModified.c_str();
   }
   return result;
 }
@@ -368,9 +360,7 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
           static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
           static_cast<unsigned>(ESP.getMaxAllocHeap()));
 
-  if (Storage.exists(destPath.c_str())) {
-    Storage.remove(destPath.c_str());
-  }
+  Storage.remove(destPath.c_str());
 
   FsFile file;
   if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {

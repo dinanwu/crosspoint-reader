@@ -108,14 +108,18 @@ void SubscriptionSyncService::taskBody() {
     vTaskDelay(1);
   }
 
+  const uint64_t nowMs = static_cast<uint64_t>(millis());
   if (mutex_ && xSemaphoreTake(mutex_, portMAX_DELAY) == pdTRUE) {
     const auto& p = syncer_.progress();
     lastResult_.phase = p.phase;
-    lastResult_.failure = p.failure;
+    // Only carry a failure reason on Failed — Done/Cancelled would otherwise
+    // latch whatever progress_.failure was at the moment the run ended.
+    lastResult_.failure = (p.phase == SubscriptionSyncer::Phase::Failed) ? p.failure : SubscriptionSyncer::FailureReason::None;
     lastResult_.anyChanges = p.anyChanges;
-    lastResult_.finishedAtMs = static_cast<uint64_t>(millis());
+    lastResult_.finishedAtMs = nowMs;
     xSemaphoreGive(mutex_);
   }
+  lastFinishedAtMs_.store(nowMs, std::memory_order_release);
   running_.store(false, std::memory_order_release);
   activityManager.requestUpdate(true);
 
