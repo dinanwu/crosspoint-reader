@@ -12,20 +12,47 @@ namespace {
 // best-effort way: etags are preserved but seriesMeta stays empty until the
 // next successful download repopulates it.
 constexpr uint8_t STATE_FORMAT_VERSION = 2;
-constexpr char SUBSCRIPTIONS_DIR[] = "/.subscriptions";
-constexpr char EPUB_CACHE_DIR[] = "/.crosspoint";
+
+void readSeriesMeta(JsonObjectConst entry, SubscriptionState::SeriesMeta& m) {
+  m.title = entry["title"] | "";
+  m.localPath = entry["localPath"] | "";
+  m.lastSyncedMs = entry["lastSyncedMs"] | 0ULL;
+  m.lastKnownSpineCount = entry["lastKnownSpineCount"] | 0;
+}
+
+void writeSeriesMeta(JsonObject entry, const SubscriptionState::SeriesMeta& m) {
+  entry["title"] = m.title;
+  entry["localPath"] = m.localPath;
+  entry["lastSyncedMs"] = m.lastSyncedMs;
+  entry["lastKnownSpineCount"] = m.lastKnownSpineCount;
+}
 }  // namespace
 
+constexpr char SubscriptionState::SUBSCRIPTIONS_DIR[];
+constexpr char SubscriptionState::EPUB_CACHE_DIR[];
 constexpr char SubscriptionState::STATE_FILE_PATH[];
+constexpr char SubscriptionState::INDEX_ENDPOINT[];
+constexpr char SubscriptionState::WATERMARK_FILENAME[];
+
+std::string SubscriptionState::epubPathForId(const std::string& seriesId) {
+  return std::string(SUBSCRIPTIONS_DIR) + "/" + seriesId + ".epub";
+}
+
+std::string SubscriptionState::partPathForId(const std::string& seriesId) {
+  return epubPathForId(seriesId) + ".part";
+}
 
 std::string SubscriptionState::cachePathForEpub(const std::string& epubPath) {
   return std::string(EPUB_CACHE_DIR) + "/epub_" + std::to_string(std::hash<std::string>{}(epubPath));
 }
 
+std::string SubscriptionState::watermarkPathForEpub(const std::string& epubPath) {
+  return cachePathForEpub(epubPath) + "/" + WATERMARK_FILENAME;
+}
+
 uint16_t SubscriptionState::readWatermark(const std::string& epubPath) {
-  const std::string path = cachePathForEpub(epubPath) + "/sub_watermark.bin";
   FsFile f;
-  if (!Storage.openFileForRead("SUB", path, f)) {
+  if (!Storage.openFileForRead("SUB", watermarkPathForEpub(epubPath), f)) {
     return 0;
   }
   uint8_t buf[2] = {0, 0};
@@ -38,15 +65,18 @@ uint16_t SubscriptionState::readWatermark(const std::string& epubPath) {
 bool SubscriptionState::writeWatermark(const std::string& epubPath, uint16_t spineCount) {
   const std::string cacheDir = cachePathForEpub(epubPath);
   Storage.mkdir(cacheDir.c_str());
-  const std::string path = cacheDir + "/sub_watermark.bin";
   FsFile f;
-  if (!Storage.openFileForWrite("SUB", path, f)) {
+  if (!Storage.openFileForWrite("SUB", cacheDir + "/" + WATERMARK_FILENAME, f)) {
     return false;
   }
   const uint8_t buf[2] = {static_cast<uint8_t>(spineCount & 0xff), static_cast<uint8_t>((spineCount >> 8) & 0xff)};
   f.write(buf, 2);
   f.close();
   return true;
+}
+
+bool SubscriptionState::isSubscription(const std::string& epubPath) {
+  return Storage.exists(watermarkPathForEpub(epubPath).c_str());
 }
 
 bool SubscriptionState::load() {
@@ -94,10 +124,7 @@ bool SubscriptionState::load() {
       JsonObjectConst entry = kv.value().as<JsonObjectConst>();
       if (entry.isNull()) continue;
       SeriesMeta m;
-      m.title = entry["title"] | "";
-      m.localPath = entry["localPath"] | "";
-      m.lastSyncedMs = entry["lastSyncedMs"] | 0ULL;
-      m.lastKnownSpineCount = entry["lastKnownSpineCount"] | 0;
+      readSeriesMeta(entry, m);
       seriesMeta.emplace(kv.key().c_str(), std::move(m));
     }
   }
@@ -121,11 +148,7 @@ bool SubscriptionState::save() const {
 
   JsonObject metaMap = doc["seriesMeta"].to<JsonObject>();
   for (const auto& kv : seriesMeta) {
-    JsonObject entry = metaMap[kv.first].to<JsonObject>();
-    entry["title"] = kv.second.title;
-    entry["localPath"] = kv.second.localPath;
-    entry["lastSyncedMs"] = kv.second.lastSyncedMs;
-    entry["lastKnownSpineCount"] = kv.second.lastKnownSpineCount;
+    writeSeriesMeta(metaMap[kv.first].to<JsonObject>(), kv.second);
   }
 
   String out;
@@ -135,6 +158,13 @@ bool SubscriptionState::save() const {
     return false;
   }
   return true;
+}
+
+std::string SubscriptionState::findIdByLocalPath(const std::string& epubPath) const {
+  for (const auto& kv : seriesMeta) {
+    if (kv.second.localPath == epubPath) return kv.first;
+  }
+  return {};
 }
 
 std::vector<std::string> SubscriptionState::unreadSeriesIds(const std::string& excludedId) const {

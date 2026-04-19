@@ -2,22 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
 
 #include "SubscriptionState.h"
 
-// Drives the end-to-end subscription sync as a step-at-a-time state machine so the
-// owning activity can poll progress between phases and render status updates.
-//
-// Typical flow from an activity's loop():
-//   if (!syncer.isTerminal()) {
-//     syncer.tick();
-//     requestUpdate();
-//   } else {
-//     finish();
-//   }
+// Step-at-a-time state machine driving an end-to-end subscription sync. The
+// owning task calls tick() in a loop and polls progress() between phases.
 class SubscriptionSyncer {
  public:
   enum class Phase : uint8_t {
@@ -56,15 +47,16 @@ class SubscriptionSyncer {
   };
 
   // Validates preconditions (enabled, URL, token, creds). Returns false if the sync
-  // should not run; the activity should simply finish() in that case.
+  // should not run; the caller should simply finish() in that case.
   bool begin();
 
-  // Fires whenever progress_ has been updated during a blocking per-series download.
-  // The owning activity uses this to request a re-render while tick() is stuck
-  // inside HTTPClient::writeToStream — without it the progress bar is frozen on
-  // whatever state was visible when the download started.
-  using ProgressListener = std::function<void()>;
-  void setProgressListener(ProgressListener listener) { progressListener_ = std::move(listener); }
+  // Fires whenever progress_ advances during a blocking per-series download. Without
+  // it the progress bar would freeze until tick() returns from HTTPClient::writeToStream.
+  using ProgressListener = void (*)(void* ctx);
+  void setProgressListener(ProgressListener fn, void* ctx) {
+    progressListener_ = fn;
+    progressCtx_ = ctx;
+  }
 
   // Advances one step. Safe to call while isTerminal() — no-op.
   void tick();
@@ -75,7 +67,7 @@ class SubscriptionSyncer {
   const Progress& progress() const { return progress_; }
   bool isTerminal() const;
 
-  // Trims whitespace, trailing slashes, and a trailing "/v1/subs/index.json" suffix so
+  // Trims whitespace, trailing slashes, and a trailing INDEX_ENDPOINT suffix so
   // users who paste the full endpoint URL from the docs still get a valid base.
   static std::string normalizeServerUrl(std::string url);
 
@@ -92,16 +84,10 @@ class SubscriptionSyncer {
   void transitionTo(Phase p);
   bool connectWifi();
   bool fetchAndParseIndex();
-  // Downloads the series at seriesIndex_. Returns true on success (or intentional skip);
-  // sets failure and returns false on terminal error for the whole sync.
   bool downloadCurrentSeries();
   void cleanupOrphans();
   void teardownWifi();
-  // Writes SeriesMeta for the given series. When chapterCount > 0 the index already
-  // told us how many spine items the EPUB has, so we can skip Epub::load entirely —
-  // otherwise we fall back to parsing the EPUB (expensive: ~18s for a 2MB file).
-  void populateSeriesMeta(const std::string& seriesId, const std::string& title, const std::string& epubPath,
-                          uint16_t chapterCount);
+  void populateSeriesMeta(const SeriesEntry& series, const std::string& epubPath);
 
   Progress progress_;
   SubscriptionState state_;
@@ -110,9 +96,9 @@ class SubscriptionSyncer {
   std::vector<SeriesEntry> seriesFromIndex_;
   std::vector<std::string> orphanIds_;  // local IDs no longer in index
   size_t seriesIndex_ = 0;
-  size_t orphanIndex_ = 0;
   bool indexUnchanged_ = false;
   bool abortRequested_ = false;
   std::string newIndexEtag_;
-  ProgressListener progressListener_;
+  ProgressListener progressListener_ = nullptr;
+  void* progressCtx_ = nullptr;
 };

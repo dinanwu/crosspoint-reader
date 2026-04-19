@@ -8,17 +8,15 @@
 #include <WiFi.h>
 #include <esp_sntp.h>
 
+#include <cstring>
 #include <ctime>
-#include <functional>
+#include <unordered_set>
 
 #include "CrossPointSettings.h"
 #include "HttpDownloader.h"
 #include "WifiCredentialStore.h"
 
 namespace {
-constexpr char SUBSCRIPTIONS_DIR[] = "/.subscriptions";
-constexpr char EPUB_CACHE_DIR[] = "/.crosspoint";
-constexpr char INDEX_ENDPOINT[] = "/v1/subs/index.json";
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint8_t SUPPORTED_FORMAT_VERSION = 1;
 
@@ -43,20 +41,10 @@ std::string joinUrl(const std::string& base, const std::string& path) {
   if (path.empty()) return base;
   const bool baseSlash = base.back() == '/';
   const bool pathSlash = path.front() == '/';
-  if (baseSlash && pathSlash) {
-    return base + path.substr(1);
-  }
-  if (!baseSlash && !pathSlash) {
-    return base + "/" + path;
-  }
+  if (baseSlash && pathSlash) return base + path.substr(1);
+  if (!baseSlash && !pathSlash) return base + "/" + path;
   return base + path;
 }
-
-std::string epubPathForId(const std::string& seriesId) {
-  return std::string(SUBSCRIPTIONS_DIR) + "/" + seriesId + ".epub";
-}
-
-std::string partPathForId(const std::string& seriesId) { return epubPathForId(seriesId) + ".part"; }
 }  // namespace
 
 std::string SubscriptionSyncer::normalizeServerUrl(std::string url) {
@@ -69,9 +57,9 @@ std::string SubscriptionSyncer::normalizeServerUrl(std::string url) {
   };
   stripTrailingSlashes();
 
-  constexpr char SUFFIX[] = "/v1/subs/index.json";
-  constexpr size_t suffixLen = sizeof(SUFFIX) - 1;
-  if (url.size() >= suffixLen && url.compare(url.size() - suffixLen, suffixLen, SUFFIX) == 0) {
+  const char* suffix = SubscriptionState::INDEX_ENDPOINT;
+  const size_t suffixLen = std::strlen(suffix);
+  if (url.size() >= suffixLen && url.compare(url.size() - suffixLen, suffixLen, suffix) == 0) {
     url.resize(url.size() - suffixLen);
     stripTrailingSlashes();
   }
@@ -82,15 +70,13 @@ bool SubscriptionSyncer::begin() {
   progress_ = Progress{};
   transitionTo(Phase::Idle);
 
-  // Reset all per-run transient state — a prior Cancelled/Failed run leaves these
-  // set, which would otherwise poison the next run (notably abortRequested_, which
-  // would flip the very next tick() straight to Cancelled without doing any work).
+  // Clear all per-run transient state — a prior Cancelled/Failed run would
+  // otherwise leave abortRequested_ set and terminate the next run immediately.
   abortRequested_ = false;
   indexUnchanged_ = false;
   seriesFromIndex_.clear();
   orphanIds_.clear();
   seriesIndex_ = 0;
-  orphanIndex_ = 0;
   newIndexEtag_.clear();
 
   if (!SETTINGS.subscriptionsEnabled) {
@@ -103,7 +89,6 @@ bool SubscriptionSyncer::begin() {
   }
   if (WIFI_STORE.getCredentials().empty()) {
     LOG_DBG("SUB", "No Wi-Fi credentials saved");
-    progress_.failure = FailureReason::NoCredentials;
     return false;
   }
 
@@ -112,10 +97,9 @@ bool SubscriptionSyncer::begin() {
 
   state_.load();  // absence is fine; fresh state persists after first successful sync
 
-  // Ensure the subscriptions directory exists before any download tries to write
-  // into it. State::save() also mkdir's, but that only runs after a successful
-  // download — leaving the first-ever sync unable to open its .part file.
-  Storage.mkdir(SUBSCRIPTIONS_DIR);
+  // State::save() mkdir's, but it only runs after a successful download — the
+  // first-ever sync would otherwise fail to open its .part file.
+  Storage.mkdir(SubscriptionState::SUBSCRIPTIONS_DIR);
   return true;
 }
 
@@ -213,8 +197,6 @@ void SubscriptionSyncer::tick() {
 }
 
 bool SubscriptionSyncer::connectWifi() {
-  // Use the last-connected SSID if we have credentials for it; otherwise take the first
-  // stored credential. Simple and matches how users typically have a single home Wi-Fi.
   const auto& creds = WIFI_STORE.getCredentials();
   if (creds.empty()) return false;
 
@@ -248,7 +230,7 @@ bool SubscriptionSyncer::connectWifi() {
 }
 
 bool SubscriptionSyncer::fetchAndParseIndex() {
-  const std::string url = joinUrl(serverUrl_, INDEX_ENDPOINT);
+  const std::string url = joinUrl(serverUrl_, SubscriptionState::INDEX_ENDPOINT);
   std::string body;
 
   const auto result = HttpDownloader::fetchConditional(url, body, bearerToken_, state_.indexEtag);
@@ -311,19 +293,13 @@ bool SubscriptionSyncer::fetchAndParseIndex() {
 
   newIndexEtag_ = result.etag;
 
-  // Build orphan list: local series no longer present in the index.
+  std::unordered_set<std::string> freshIds;
+  freshIds.reserve(seriesFromIndex_.size());
+  for (const auto& s : seriesFromIndex_) freshIds.insert(s.id);
+
   orphanIds_.clear();
   for (const auto& kv : state_.seriesEtags) {
-    bool stillPresent = false;
-    for (const auto& s : seriesFromIndex_) {
-      if (s.id == kv.first) {
-        stillPresent = true;
-        break;
-      }
-    }
-    if (!stillPresent) {
-      orphanIds_.push_back(kv.first);
-    }
+    if (freshIds.find(kv.first) == freshIds.end()) orphanIds_.push_back(kv.first);
   }
 
   LOG_DBG("SUB", "Index parsed: %u series, %u orphans", static_cast<unsigned>(seriesFromIndex_.size()),
@@ -334,26 +310,22 @@ bool SubscriptionSyncer::fetchAndParseIndex() {
 bool SubscriptionSyncer::downloadCurrentSeries() {
   const SeriesEntry& series = seriesFromIndex_[seriesIndex_];
   const std::string url = joinUrl(serverUrl_, series.url);
-  const std::string destPath = epubPathForId(series.id);
-  const std::string partPath = partPathForId(series.id);
+  const std::string destPath = SubscriptionState::epubPathForId(series.id);
+  const std::string partPath = SubscriptionState::partPathForId(series.id);
 
-  // If index says the etag matches what we last stored, no need to hit the server.
   auto it = state_.seriesEtags.find(series.id);
   if (!series.etag.empty() && it != state_.seriesEtags.end() && it->second == series.etag &&
       Storage.exists(destPath.c_str())) {
     LOG_DBG("SUB", "Series '%s' unchanged by index etag, skipping", series.id.c_str());
-    // Backfill metadata for pre-existing series missing from seriesMeta (e.g. users
-    // upgrading from state format v1, where seriesEtags existed but seriesMeta did
-    // not). Without this, such series would stay invisible in the inbox until the
-    // server changed their etag.
+    // Backfill metadata for state.json v1 files, which stored seriesEtags but
+    // no seriesMeta — the inbox would otherwise hide the series until the
+    // server changed its etag.
     if (state_.seriesMeta.find(series.id) == state_.seriesMeta.end()) {
-      populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
+      populateSeriesMeta(series, destPath);
     }
     return true;
   }
 
-  // Send our stored etag as If-None-Match so the server can still 304 us if it's up
-  // to date. Empty string means "we don't have this series locally yet".
   const std::string ifNoneMatch = (it != state_.seriesEtags.end()) ? it->second : std::string();
 
   LOG_INF("SUB", "Downloading series '%s' (%zu bytes expected) url=%s ifNoneMatch=%s", series.id.c_str(), series.size,
@@ -362,13 +334,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   auto progressCb = [this, total = series.size](size_t downloaded, size_t reportedTotal) -> bool {
     progress_.bytesDone = downloaded;
     progress_.bytesTotal = total > 0 ? total : reportedTotal;
-
-    // Give the UI a chance to re-render. The download runs on the SubSync task,
-    // so without this hook the inbox never sees byte progress between the
-    // phase-boundary publishes from taskBody().
-    if (progressListener_) {
-      progressListener_();
-    }
+    if (progressListener_) progressListener_(progressCtx_);
     return !abortRequested_;
   };
 
@@ -376,10 +342,8 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
 
   if (result.status == 304) {
     LOG_DBG("SUB", "Series '%s' 304 Not Modified", series.id.c_str());
-    // Keep existing file and state intact; backfill metadata on first sync after
-    // the state schema upgrade so the inbox can enumerate pre-existing series.
     if (state_.seriesMeta.find(series.id) == state_.seriesMeta.end() && Storage.exists(destPath.c_str())) {
-      populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
+      populateSeriesMeta(series, destPath);
     }
     return true;
   }
@@ -396,11 +360,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   }
 
   if (result.status != 200) {
-    // Partial/failed transfer. Remove the .part file. If the user aborted we leave
-    // progress_.failure unset so tick() can transition to Cancelled.
-    if (Storage.exists(partPath.c_str())) {
-      Storage.remove(partPath.c_str());
-    }
+    Storage.remove(partPath.c_str());
     if (abortRequested_) {
       LOG_DBG("SUB", "Series '%s' download aborted by user", series.id.c_str());
       return false;
@@ -411,10 +371,8 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     return false;
   }
 
-  // Atomic swap: .part -> .epub
-  if (Storage.exists(destPath.c_str())) {
-    Storage.remove(destPath.c_str());
-  }
+  // Atomic swap: .part -> .epub. remove(destPath) is a no-op when missing.
+  Storage.remove(destPath.c_str());
   if (!Storage.rename(partPath.c_str(), destPath.c_str())) {
     LOG_ERR("SUB", "Failed to rename %s -> %s", partPath.c_str(), destPath.c_str());
     Storage.remove(partPath.c_str());
@@ -422,19 +380,15 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     return false;
   }
 
-  // Invalidate the book.bin cache so Epub::load picks up the new spine on next open.
-  // Leave sections/ and progress.bin alone.
+  // Invalidate book.bin so Epub::load reparses the new spine on next open.
+  // sections/ and progress.bin stay — chapter N's layout is still valid under
+  // the server's append-only, stable-spine-index invariant.
   const std::string cachePath = SubscriptionState::cachePathForEpub(destPath);
-  const std::string bookBinPath = cachePath + "/book.bin";
-  if (Storage.exists(bookBinPath.c_str())) {
-    Storage.remove(bookBinPath.c_str());
-  }
+  Storage.remove((cachePath + "/book.bin").c_str());
 
-  // Seed at 0 on first download (never overwrite an existing sidecar — the reader
-  // owns it after that). A fresh subscribe reports every chapter as unread so the
-  // inbox surfaces it under "New chapters" with a full unread-count badge.
-  const std::string watermarkPath = cachePath + "/sub_watermark.bin";
-  if (!Storage.exists(watermarkPath.c_str())) {
+  // Seed watermark at 0 only if absent — the reader owns the sidecar after first open,
+  // and a fresh subscribe should surface every chapter as unread.
+  if (!SubscriptionState::isSubscription(destPath)) {
     if (SubscriptionState::writeWatermark(destPath, 0)) {
       LOG_DBG("SUB", "Seeded watermark for '%s' at 0 (chapterCount=%u)", series.id.c_str(), series.chapterCount);
     } else {
@@ -442,10 +396,9 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     }
   }
 
-  // Persist the new etag immediately so a crash mid-sync doesn't re-download what we
-  // already have.
+  // Persist etag before advancing — a mid-sync crash won't force re-downloads.
   state_.seriesEtags[series.id] = result.etag;
-  populateSeriesMeta(series.id, series.title, destPath, series.chapterCount);
+  populateSeriesMeta(series, destPath);
   state_.save();
 
   progress_.anyChanges = true;
@@ -453,23 +406,20 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   return true;
 }
 
-void SubscriptionSyncer::populateSeriesMeta(const std::string& seriesId, const std::string& title,
-                                            const std::string& epubPath, uint16_t chapterCount) {
+void SubscriptionSyncer::populateSeriesMeta(const SeriesEntry& series, const std::string& epubPath) {
   SubscriptionState::SeriesMeta m;
-  m.title = title;
+  m.title = series.title;
   m.localPath = epubPath;
   // time(nullptr) returns unix seconds once NTP has synced earlier in this run.
   m.lastSyncedMs = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
 
-  if (chapterCount > 0) {
-    // Fast path: the server's index already told us the spine count, so we can
-    // skip the full Epub::load (~18s for a 2MB book on ESP32-C3). The server is
-    // the source of truth for subscription contents per docs/subscription-sync.md.
-    m.lastKnownSpineCount = chapterCount;
+  if (series.chapterCount > 0) {
+    // Fast path per docs/subscription-sync.md: server is the source of truth for
+    // spine count, so we skip Epub::load (~18s for a 2MB book on ESP32-C3).
+    m.lastKnownSpineCount = series.chapterCount;
   } else {
-    // Fallback for older servers that don't send chapterCount: parse the EPUB.
-    // Keeps the inbox "N new chapters" badge working at the cost of a long stall.
-    Epub epub(epubPath, EPUB_CACHE_DIR);
+    // Fallback for older servers that omit chapterCount.
+    Epub epub(epubPath, SubscriptionState::EPUB_CACHE_DIR);
     if (!epub.load(true, true)) {
       LOG_ERR("SUB", "Failed to load epub for metadata: %s", epubPath.c_str());
       return;
@@ -477,20 +427,14 @@ void SubscriptionSyncer::populateSeriesMeta(const std::string& seriesId, const s
     m.lastKnownSpineCount = static_cast<uint16_t>(epub.getSpineItemsCount());
   }
 
-  state_.seriesMeta[seriesId] = std::move(m);
+  state_.seriesMeta[series.id] = std::move(m);
 }
 
 void SubscriptionSyncer::cleanupOrphans() {
   for (const auto& orphanId : orphanIds_) {
-    const std::string epubPath = epubPathForId(orphanId);
-    const std::string cachePath = SubscriptionState::cachePathForEpub(epubPath);
-
-    if (Storage.exists(epubPath.c_str())) {
-      Storage.remove(epubPath.c_str());
-    }
-    if (Storage.exists(cachePath.c_str())) {
-      Storage.removeDir(cachePath.c_str());
-    }
+    const std::string epubPath = SubscriptionState::epubPathForId(orphanId);
+    Storage.remove(epubPath.c_str());
+    Storage.removeDir(SubscriptionState::cachePathForEpub(epubPath).c_str());
     state_.seriesEtags.erase(orphanId);
     state_.seriesMeta.erase(orphanId);
     progress_.anyChanges = true;

@@ -109,8 +109,7 @@ void SubscriptionsInboxActivity::triggerSyncOrWifi() {
     return;
   }
   if (WIFI_STORE.getCredentials().empty()) {
-    // Skip the NoCredentials failure banner round-trip — route straight to Wi-Fi
-    // setup and auto-start sync on success so the user's intent is honored.
+    // Skip the NoCredentials failure-banner round-trip; auto-start sync on success.
     launchWifiSelection(/*startSyncOnSuccess=*/true);
     return;
   }
@@ -139,9 +138,8 @@ void SubscriptionsInboxActivity::onEnter() {
   if (configured) {
     loadEntries();
   }
-  // Prime this against the current service result so loop() only triggers a
-  // reload when a *new* sync finishes while we're visible.
-  lastSeenResultMs = SubscriptionSyncService::instance().lastResult().finishedAtMs;
+  // Prime so loop() reloads only when a *new* sync finishes while we're visible.
+  lastSeenResultMs = SubscriptionSyncService::instance().fullSnapshot().lastResult.finishedAtMs;
   selectorIndex = 0;
   requestUpdate();
 }
@@ -162,9 +160,9 @@ void SubscriptionsInboxActivity::loop() {
 
   // Pick up newly-downloaded series while the Inbox is still on screen —
   // finishedAtMs is the only monotonic signal for "a sync just sealed".
-  const auto lastResult = syncService.lastResult();
-  if (lastResult.finishedAtMs != 0 && lastResult.finishedAtMs != lastSeenResultMs) {
-    lastSeenResultMs = lastResult.finishedAtMs;
+  const uint64_t finishedAtMs = syncService.fullSnapshot().lastResult.finishedAtMs;
+  if (finishedAtMs != 0 && finishedAtMs != lastSeenResultMs) {
+    lastSeenResultMs = finishedAtMs;
     loadEntries();
     if (selectorIndex >= entries.size()) {
       selectorIndex = entries.empty() ? 0 : (entries.size() - 1);
@@ -179,14 +177,11 @@ void SubscriptionsInboxActivity::loop() {
 
   if (!configured) {
     if (mappedInput.wasReleased(Button::Confirm)) {
-      // Launch the settings web server so the user can configure subscriptions
-      // from a phone or laptop. This is the same activity as File Transfer.
       activityManager.goToFileTransfer();
     }
     return;
   }
 
-  // Latch so the upcoming release doesn't also fire short-press Open.
   if (!syncTriggeredByLongPress && mappedInput.isPressed(Button::Confirm) &&
       mappedInput.getHeldTime() >= LONG_PRESS_SYNC_MS) {
     syncTriggeredByLongPress = true;
@@ -202,14 +197,12 @@ void SubscriptionsInboxActivity::loop() {
     if (!entries.empty() && selectorIndex < entries.size()) {
       onSelectBook(entries[selectorIndex].localPath);
     } else if (entries.empty()) {
-      // With no books to open, Confirm is unambiguously the sync trigger — users
-      // shouldn't have to discover the long-press affordance to get started.
+      // Short-press is unambiguously the sync trigger when there's nothing to open.
       triggerSyncOrWifi();
     }
     return;
   }
 
-  // Navigation: side Up / front Left = previous, side Down / front Right = next.
   buttonNavigator.onPreviousRelease([this, listSize] {
     selectorIndex = ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize);
     requestUpdate();

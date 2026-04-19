@@ -73,26 +73,15 @@ void EpubReaderActivity::onEnter() {
     }
   }
 
-  // Detect subscription + read watermark. Presence of sub_watermark.bin marks this
-  // EPUB as a subscription series; the uint16_t value is the spine count at the last
-  // onExit (i.e. what the user has seen).
-  {
-    const std::string watermarkPath = epub->getCachePath() + "/sub_watermark.bin";
-    FsFile wf;
-    if (Storage.openFileForRead("ERS", watermarkPath, wf)) {
-      uint8_t buf[2];
-      const int n = wf.read(buf, 2);
-      if (n == 2) {
-        isSubscription = true;
-        watermarkSpineCount = buf[0] + (buf[1] << 8);
-        LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
-                epub->getSpineItemsCount());
-      } else {
-        LOG_DBG("ERS", "sub_watermark.bin present but read %d bytes; isSubscription stays false", n);
-      }
-    } else {
-      LOG_DBG("ERS", "No sub_watermark.bin at %s; isSubscription stays false", watermarkPath.c_str());
-    }
+  // Presence of sub_watermark.bin marks this EPUB as a subscription. auto-advance
+  // at book end depends on this signal being fresh per-open — reset before probing.
+  isSubscription = false;
+  watermarkSpineCount = 0;
+  if (SubscriptionState::isSubscription(epub->getPath())) {
+    isSubscription = true;
+    watermarkSpineCount = SubscriptionState::readWatermark(epub->getPath());
+    LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
+            epub->getSpineItemsCount());
   }
   // We may want a better condition to detect if we are opening for the first time.
   // This will trigger if the book is re-opened at Chapter 0.
@@ -119,25 +108,19 @@ void EpubReaderActivity::onExit() {
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
-  // Re-arm the subscription watermark so the next sync's additions grow the inbox
-  // unread-count badge. Pull the value from state.json's lastKnownSpineCount (same
-  // number the inbox uses for its subtraction) rather than epub->getSpineItemsCount(),
-  // because the server's chapterCount may not equal raw OPF spine count (e.g. cover
-  // or nav items). If the two were stored in different coordinate systems, a single
-  // book open would leave watermark > lastKnownSpineCount forever, permanently
-  // zeroing the badge.
+  // Re-arm the subscription watermark to the server-reported spine count — the
+  // same number the inbox subtracts against. Raw OPF spine count drifts whenever
+  // chapterCount != getSpineItemsCount() (cover/nav items), which would
+  // permanently zero the unread badge after a single open.
   if (isSubscription && epub) {
     uint16_t newWatermark = 0;
     SubscriptionState state;
     if (state.load()) {
-      for (const auto& kv : state.seriesMeta) {
-        if (kv.second.localPath == epub->getPath() && kv.second.lastKnownSpineCount > 0) {
-          newWatermark = kv.second.lastKnownSpineCount;
-          break;
-        }
+      const std::string id = state.findIdByLocalPath(epub->getPath());
+      if (!id.empty()) {
+        newWatermark = state.seriesMeta[id].lastKnownSpineCount;
       }
     }
-    // Fallback for first-ever open before any sync has populated seriesMeta.
     if (newWatermark == 0) {
       newWatermark = static_cast<uint16_t>(epub->getSpineItemsCount());
     }
@@ -957,17 +940,7 @@ bool EpubReaderActivity::tryAutoAdvanceToNextSubscription() {
   SubscriptionState state;
   if (!state.load()) return false;
 
-  // Resolve current series id by matching the on-disk path against stored metadata.
-  std::string currentId;
-  const std::string& path = epub->getPath();
-  for (const auto& kv : state.seriesMeta) {
-    if (kv.second.localPath == path) {
-      currentId = kv.first;
-      break;
-    }
-  }
-
-  const auto candidates = state.unreadSeriesIds(currentId);
+  const auto candidates = state.unreadSeriesIds(state.findIdByLocalPath(epub->getPath()));
   if (candidates.empty()) return false;
 
   auto it = state.seriesMeta.find(candidates.front());
