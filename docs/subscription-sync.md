@@ -275,7 +275,7 @@ On-device code:
 | HTTP layer (bearer auth, conditional GET, ETag extraction) | [src/network/HttpDownloader.{h,cpp}](../src/network/HttpDownloader.h) |
 | Subscriptions Inbox (unread list, sync banner, long-press manual sync/cancel) | [src/activities/home/SubscriptionsInboxActivity.{h,cpp}](../src/activities/home/SubscriptionsInboxActivity.h) |
 | Boot-path trigger on `PowerButton` wake | [src/main.cpp:310](../src/main.cpp) |
-| Break page + watermark write on reader exit; auto-advance to next unread series | [src/activities/reader/EpubReaderActivity.{h,cpp}](../src/activities/reader/EpubReaderActivity.h) |
+| Watermark write on reader exit; auto-advance to next unread series | [src/activities/reader/EpubReaderActivity.{h,cpp}](../src/activities/reader/EpubReaderActivity.h) |
 | Auto-sleep inhibit while sync is running | [src/activities/ActivityManager.cpp:224-227](../src/activities/ActivityManager.cpp) |
 | Settings fields (enabled flag, server URL, bearer token) | [src/CrossPointSettings.h:202](../src/CrossPointSettings.h), [src/SettingsList.h:124](../src/SettingsList.h) |
 | Settings-web test endpoint | [src/network/CrossPointWebServer.cpp:1267](../src/network/CrossPointWebServer.cpp) |

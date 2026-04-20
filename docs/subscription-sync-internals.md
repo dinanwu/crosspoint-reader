@@ -511,7 +511,7 @@ Elapsed: ~2-3 s including Wi-Fi connect.
 
 - **"Sync is slow"** — check `[HTTP] Begin download` and `[HTTP] Download complete` timestamps. Per-byte progress lines appear every 64 KB.
 - **"Inbox says failed"** — check for `[SUB]` line with the failure reason. The banner maps `FailureReason` → translated string; the log has the raw HTTP code or parser error.
-- **"Break page didn't show"** — `[ERS] Subscription detected, watermark=N, spineCount=M` confirms detection. If absent, the sidecar wasn't seeded; trigger a sync.
+- **"Subscription not detected"** — `[ERS] Subscription detected, watermark=N, spineCount=M` confirms detection. If absent, the sidecar wasn't seeded; trigger a sync.
 - **"New chapters didn't appear after sync"** — check `book.bin` invalidation log line and that the reader activity reopened the book after sync (open EPUB holds stale spine).
 
 ### Forcing states for manual testing
