@@ -52,7 +52,7 @@ Audience: firmware contributors touching any file under `src/network/Subscriptio
 │    ├─ book.bin               # deleted on re-download to force reparse       │
 │    ├─ sections/              # preserved across re-downloads                 │
 │    ├─ progress.bin           # preserved across re-downloads                 │
-│    └─ sub_watermark.bin      # 2-byte LE spine count at last reader exit     │
+│    └─ sub_watermark.bin      # 2-byte LE reading position (chapter-count)    │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -198,10 +198,10 @@ Long-press Confirm (≥1000 ms) toggles `startIfIdle()` / `cancel()`. A latch fl
 
 ### `EpubReaderActivity` (`src/activities/reader/EpubReaderActivity.{h,cpp}`)
 
-Detects subscription status on `onEnter()` by attempting to read `sub_watermark.bin`. If present, `isSubscription = true` and `watermarkSpineCount` is loaded. This drives two behaviors:
+Detects subscription status on `onEnter()` by attempting to read `sub_watermark.bin`. If present, `isSubscription = true`, `watermarkSpineCount` is loaded, and `lastKnownSpineCountAtOpen` is captured from `state.json` so auto-advance can tell if the series grew during the session. This drives two behaviors:
 
-1. **Watermark re-arm**: on `onExit()`, writes the current spine count back so the next sync's additions grow the inbox unread-count badge.
-2. **Auto-advance**: at end-of-book (`currentSpineIndex >= spine count` + forward press), calls `tryAutoAdvanceToNextSubscription()` which picks the most-recently-synced other subscription with unread chapters.
+1. **Watermark re-arm**: on `onExit()`, writes the user's current reading position (in chapter-count space — `currentSpineIndex` minus OPF preamble, clamped to `lastKnownSpineCount`) back to the sidecar. The inbox badge is then "chapters past where I've read," not "chapters added since last open."
+2. **Auto-advance**: at end-of-book (`currentSpineIndex >= spine count` + forward press), calls `tryAutoAdvanceToNextSubscription()`. If the current series' `lastKnownSpineCount` has grown since open (mid-session sync downloaded new chapters), it saves progress at the past-the-end sentinel and reloads the *same* book so the user lands on the first new chapter. Only if the current series is genuinely exhausted does it fall through to the most-recently-synced other subscription with unread chapters.
 
 ---
 
@@ -251,7 +251,13 @@ On observed abort, the task lands on `Phase::Cancelled` (not `Failed`) if the tr
 Two bytes, little-endian unsigned int. Presence of the file marks the EPUB as a subscription.
 
 - **Seeded** by the syncer on first download at `0` — a fresh subscribe reports every chapter as unread so the inbox surfaces the series under "New chapters".
-- **Re-armed** by the reader on `onExit()` to the current `lastKnownSpineCount` read from `state.json` (falling back to `epub->getSpineItemsCount()` if state.json is unavailable). Pulling from state.json keeps the watermark in the same coordinate system as the inbox's subtraction; using raw OPF spine count would drift whenever `server.chapterCount != getSpineItemsCount()` (e.g. when the OPF has cover/nav spine items the server doesn't count as chapters), and a single book open would permanently zero the badge.
+- **Re-armed** by the reader on `onExit()` to the user's reading position, translated into the server's chapter-count space:
+  - `preamble = max(0, spineCount - lastKnownSpineCount)` — number of OPF spine items the server doesn't count (cover, nav).
+  - `readChapters = max(0, currentSpineIndex - preamble)` — how far the user got, in chapters.
+  - `newWatermark = min(readChapters, lastKnownSpineCount)`.
+  - Fallback when `state.json` is unavailable or `lastKnownSpineCount == 0`: write `min(currentSpineIndex, spineCount)` directly.
+
+  The chapter-count mapping is what lets the inbox compute "+N unread" honestly. Writing raw spine position (e.g. `epub->getSpineItemsCount()`) would drift whenever the OPF has preamble items and would permanently zero the badge on any open.
 - **Never overwritten** by subsequent syncs — the reader owns the file after the initial seed.
 
 ### EPUB files — `/.subscriptions/<series-id>.epub`
@@ -282,7 +288,7 @@ An **unsubscribe** (series no longer in the index) nukes the entire cache dir vi
 
 ### Watermark re-arm on exit
 
-The reader writes the current spine count to the sidecar on every `onExit()` for subscription books, regardless of whether new chapters were read. The next sync's additions re-widen the gap, and the inbox shows the new delta as an unread-count badge on the series row.
+On every `onExit()` for a subscription book, the reader writes the user's current reading position (in chapter-count space — see "Watermark sidecar" above for the exact translation) to the sidecar. The inbox subtraction `lastKnownSpineCount - watermark` then reflects "chapters I haven't reached yet," so a brief open that reads only chapter 1 of 42 leaves "+41" in the badge instead of zeroing it.
 
 ### Auto-advance at book end
 
@@ -290,8 +296,11 @@ When the user pages past the last chapter of a subscription book, `tryAutoAdvanc
 
 1. Load `SubscriptionState`.
 2. Resolve the current series ID by matching `epub->getPath()` against stored `seriesMeta[*].localPath`.
-3. Call `state.unreadSeriesIds(currentId)` — returns series with `watermark < lastKnownSpineCount`, sorted by `lastSyncedMs` descending.
-4. If non-empty, `activityManager.goToReader(top_candidate.localPath)`; otherwise return `false` and the caller falls through to `onGoHome()`.
+3. **Check if the current series grew mid-session**: if `state.seriesMeta[currentId].lastKnownSpineCount > lastKnownSpineCountAtOpen` (captured at `onEnter`), save progress at `currentSpineIndex = epub->getSpineItemsCount()` (past-the-end sentinel) and `activityManager.goToReader(same path)`. The new reader instance re-parses the EPUB and resumes at the sentinel value, which is the spine index of the first newly-added chapter. Return `true`.
+4. Otherwise call `state.unreadSeriesIds(currentId)` — returns series with `watermark < lastKnownSpineCount`, sorted by `lastSyncedMs` descending.
+5. If non-empty, `activityManager.goToReader(top_candidate.localPath)`; otherwise return `false` and the caller falls through to `onGoHome()`.
+
+Step 3 matters because sync runs in the background while the user is reading; without it, reaching the end of the in-memory (stale) spine would hop the user to a *different* series even though new chapters of the current one are already on disk.
 
 ---
 
@@ -434,6 +443,10 @@ Orphan `.part` cleanup is **not** currently implemented — stale `.part` files 
 ### Subscriptions Inbox — not configured
 
 The "not configured" branch replaces the list with explanatory text and routes Confirm to the settings web server via `goToFileTransfer()`. The user configures URL + token from a phone or laptop, exits the web server, re-enters the Inbox, and sees the normal list.
+
+### Home menu badge
+
+`HomeActivity::onEnter` sums `lastKnownSpineCount - watermark` across every entry in `state.seriesMeta` and formats the Subscriptions menu row as `"Subscriptions +N"` (using the `STR_INBOX_UNREAD_COUNT` format). The total is cached in `subscriptionsLabel` so the render path doesn't touch SD. The badge refreshes on every re-entry to Home (e.g. back from the inbox or the reader); it does not poll during a sync, so a sync that completes while the user is on Home won't update the count until they navigate away and back.
 
 ### Settings
 

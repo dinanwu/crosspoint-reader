@@ -13,7 +13,7 @@ Subscription management (adding/removing series) is handled entirely by the serv
 - Server runs a scheduled scraper, builds one EPUB per subscribed series, and exposes them over HTTPS.
 - Device syncs on every power-button wake via a background FreeRTOS task owned by `SubscriptionSyncService`. The UI task never blocks; progress and results surface through the Subscriptions Inbox. There is no device-side interval — the two-tier conditional-GET 304 path is the effective rate limit (a no-op sync finishes in ~1 s). See [Sync trigger](#sync-trigger) for why.
 - Device treats subscription EPUBs like any other EPUB — no new reader code, no new format on disk.
-- A small sidecar (`sub_watermark.bin`) stored beside `progress.bin` tracks "new since last open" for the break-page UX and drives the Subscriptions Inbox unread list.
+- A small sidecar (`sub_watermark.bin`) stored beside `progress.bin` tracks the user's reading position (in the server's chapter-count coordinate space) and drives the Subscriptions Inbox unread list — `lastKnownSpineCount - watermark` is the inbox's "+N" badge, so the count reflects *chapters not yet read*, not just *chapters added since last open*.
 
 For device-side implementation details (threading model, phase state machine, cache invalidation, reader integration, failure modes), see [subscription-sync-internals.md](./subscription-sync-internals.md).
 
@@ -199,9 +199,9 @@ Why no interval gate: `HalPowerManager::startDeepSleep` fully powers off the RTC
 
 ### Per-series sidecar
 
-`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` spine count the user had seen at last reader exit. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book.
+`sub_watermark.bin` inside the book's EPUB cache directory (`/.crosspoint/epub_<hash>/`) — raw little-endian `uint16_t` reading position in the server's chapter-count space. Presence of the file marks the EPUB as a subscription; absence means the reader treats it as a plain book.
 
-Seeded by the syncer on first download at `0` (so a fresh subscribe reports every chapter as unread and the inbox shows the series under "New chapters"). Updated by `EpubReaderActivity::onExit` to the current spine count, after which subsequent sync additions show up as a nonzero unread-count badge on the inbox row. The syncer never touches an existing sidecar, so re-downloading a series preserves the user's read watermark.
+Seeded by the syncer on first download at `0` (so a fresh subscribe reports every chapter as unread and the inbox shows the series under "New chapters"). Updated by `EpubReaderActivity::onExit` to the user's current spine position, minus any OPF preamble items (`spineCount - lastKnownSpineCount`) and clamped to `[0, lastKnownSpineCount]`. This means the inbox badge reflects "chapters past where I've read" — opening briefly to chapter 1 of 42 leaves "+41" in the badge, not "+0". The syncer never touches an existing sidecar, so re-downloading a series preserves the user's read position.
 
 ### Global sync state
 
