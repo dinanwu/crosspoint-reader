@@ -46,7 +46,8 @@ Audience: firmware contributors touching any file under `src/network/Subscriptio
 │  /.subscriptions/                                                            │
 │    ├─ state.json             # ETags + per-series metadata                   │
 │    ├─ <series-id>.epub       # downloaded EPUBs                              │
-│    └─ <series-id>.epub.part  # in-flight download (atomic rename on success) │
+│    ├─ <series-id>.epub.part  # in-flight download (atomic rename on success) │
+│    └─ <series-id>.updating   # marker: in-flight range write; recovery flag  │
 │                                                                              │
 │  /.crosspoint/epub_<hash>/                                                   │
 │    ├─ book.bin               # deleted on re-download to force reparse       │
@@ -268,17 +269,36 @@ Downloaded atomically: written to `<series-id>.epub.part`, then renamed on succe
 
 ## Cache invalidation on re-download
 
-When a series is re-downloaded (index etag mismatch, server returns 200), the syncer invalidates just enough of the cache to force the reader to reparse the spine but keep user-visible state:
+When a series is re-downloaded, the syncer invalidates just enough of the cache to force the reader to reparse the spine but keep user-visible state. Two paths differ in atomicity strategy; the invalidation rules are the same.
+
+### Full download (`.part` staging, atomic rename)
+
+Used when the server hasn't published `stablePrefixLength` / `contentHash`, when the local `.epub` is missing, or when a prior range write left a stale `.updating` flag.
 
 | File | Action | Why |
 |---|---|---|
-| `<id>.epub` | Atomic replace | New content |
-| `book.bin` | Deleted | Spine has grown; force `Epub::load` to reparse |
+| `<id>.epub.part` | Written then atomically renamed over `.epub` | Crash-safe replacement |
+| `book.bin` | Deleted after rename | Spine has grown; force `Epub::load` to reparse |
 | `sections/` | Preserved | Chapter-N layout for existing chapters is still valid (stable-index invariant) |
 | `progress.bin` | Preserved | User's reading position is still valid |
 | `sub_watermark.bin` | Preserved | The reader owns this; sync only seeds it when absent |
 
-This relies on the server honoring the append-only, stable-spine-index invariant documented in `subscription-sync.md`. If the server inserts a chapter mid-spine, `sections/` and `progress.bin` will point at the wrong chapter — but that's a server contract violation, not a device bug.
+### Range update (in-place write, `.updating` flag)
+
+Used when the server publishes both `stablePrefixLength` and `contentHash`, and the local `.epub` already exists. In-place avoids a ~2 MB SD copy per update; the `.updating` flag converts any mid-write crash into a next-sync full re-download.
+
+| File | Action | Why |
+|---|---|---|
+| `<id>.updating` | Touched **before** the first byte is written; removed on every terminal path | Crash-recovery marker |
+| `book.bin` | Deleted **before** the in-place write | Readers must not see a stale spine alongside a half-updated EPUB |
+| `<id>.epub` | Opened with `O_RDWR` (no truncate), seeked to `oldStablePrefixLength`, streamed, truncated to new end | In-place overwrite of the tail |
+| `sections/` | Preserved | Stable-index invariant |
+| `progress.bin` | Preserved | Same |
+| `sub_watermark.bin` | Preserved | Same |
+
+After the write the full file is SHA-256'd and compared to the server's `contentHash` (see [subscription-sync-range.md](./subscription-sync-range.md)). On mismatch the `.epub` is deleted, `stablePrefixLength`/`contentHash` are cleared in `state.json`, and the next sync falls through to the full path.
+
+Both paths rely on the server honoring the append-only, stable-spine-index invariant documented in [subscription-sync.md](./subscription-sync.md). If the server inserts a chapter mid-spine, `sections/` and `progress.bin` will point at the wrong chapter — but that's a server contract violation, not a device bug.
 
 An **unsubscribe** (series no longer in the index) nukes the entire cache dir via `Storage.removeDir()` during `Cleaning`.
 
@@ -403,8 +423,10 @@ if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !HalSystem::isRebootFr
 | Index 5xx | `Failed` with `ServerError` | Next sync retries |
 | Series 404 | Skipped, sync continues | That series omitted until server publishes it again |
 | Series 5xx | `Failed` with `ServerError`; partial `.part` removed | Next sync retries that series + downstream |
-| Mid-download crash/reset | `.part` remains on SD; etag not persisted | Next sync sees etag mismatch, re-downloads (overwrites `.part`) |
+| Mid-download crash/reset (full path) | `.part` remains on SD; etag not persisted | Next sync sees etag mismatch, re-downloads (overwrites `.part`) |
 | Mid-download deep sleep (power-off) | Same as crash | Same as crash |
+| Mid-range-write crash | `.updating` flag remains; `.epub` has mixed old+new bytes; `book.bin` already deleted | `begin()` sweep clears the flag, deletes the corrupt `.epub`, clears `stablePrefixLength`/`contentHash` — next download for that series takes the full path |
+| Hash mismatch after range assembly | `.epub` deleted, etag cleared, range-extension state reset | Next sync does a clean full download |
 | NTP failure | `lastSyncedMs` may be 0 or boot-relative | Cosmetic; inbox ordering degrades |
 | Index parse failure | `Failed` with `IndexParse`; local state untouched | Next sync retries (guardrail prevents wiping local state on malformed response) |
 | Format version mismatch | `Failed` with `UnsupportedFormat` | Requires firmware update |
@@ -493,18 +515,45 @@ URL normalization is done at sync time (not at save time) via `SubscriptionSynce
 
 Elapsed: ~2-3 s including Wi-Fi connect.
 
-### Healthy sync — one series updated
+### Healthy sync — one series full-downloaded
 
 ```
 [SUB] Index parsed: 5 series, 0 orphans
 [SUB] Downloading series 'royalroad-107917' (2457600 bytes expected) ...
-[HTTP] Begin download: 2457600 bytes -> /.subscriptions/royalroad-107917.epub.part
+[HTTP] Begin download: 2457600 bytes -> /.subscriptions/royalroad-107917.epub.part (range=no start=0 ...)
 [HTTP] Download progress: 65536/2457600 bytes (2%) free=184392
 [HTTP] Download progress: 131072/2457600 bytes (5%) free=184304
 ...
-[HTTP] Download complete: 2457600 bytes in 18432ms (free=184216)
+[HTTP] Download complete: 2457600 bytes in 18432ms (free=184216 range=no)
 [SUB] Series 'royalroad-107917' downloaded (2457600 bytes)
 [SUB] Sync task exiting, stack high water: 2618
+```
+
+### Healthy sync — one series range-updated
+
+```
+[SUB] Index parsed: 5 series, 0 orphans
+[SUB] Range download 'royalroad-107917' start=2340192 new=2406528 url=...
+[HTTP] Conditional download: ... (etag="abc" range=2340192)
+[HTTP] Begin download: 66336 bytes -> /.subscriptions/royalroad-107917.epub (range=yes start=2340192 ...)
+[HTTP] Download complete: 66336 bytes in 1124ms (free=184216 range=yes)
+[SUB] Series 'royalroad-107917' range-updated (66336 bytes)
+[SUB] Sync task exiting, stack high water: 2710
+```
+
+### Range assembly produced a corrupt file
+
+```
+[SUB] Hash mismatch for /.subscriptions/royalroad-107917.epub: expected=9c1185... got=3a7c22...
+[SUB] Series 'royalroad-107917' hash mismatch after range; forcing full re-download next sync
+```
+
+### Recovery from a crashed range write
+
+```
+[SUB] Stale .updating flag for 'royalroad-107917'; forcing full re-download
+...
+[SUB] Downloading series 'royalroad-107917' (2457600 bytes expected) ...
 ```
 
 ### Common diagnostic questions

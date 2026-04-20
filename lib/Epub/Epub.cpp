@@ -461,15 +461,28 @@ bool Epub::runBackgroundCacheBuild(bool (*shouldAbort)(void*), void* shouldAbort
   }
 
   if (!buildCache->beginTocPass()) return false;
+  LOG_INF("EBP", "TOC pass starting: tocNavItem='%s' tocNcxItem='%s'", tocNavItem.c_str(), tocNcxItem.c_str());
   bool tocParsed = false;
+  bool navAttempted = false;
+  bool ncxAttempted = false;
   if (!tocNavItem.empty()) {
+    navAttempted = true;
     tocParsed = parseTocNavFile(buildCache.get());
+    LOG_INF("EBP", "parseTocNavFile => %s (tocCount now=%d)", tocParsed ? "ok" : "failed",
+            buildCache->getTocCount());
   }
   if (!tocParsed && !tocNcxItem.empty()) {
+    ncxAttempted = true;
     tocParsed = parseTocNcxFile(buildCache.get());
+    LOG_INF("EBP", "parseTocNcxFile => %s (tocCount now=%d)", tocParsed ? "ok" : "failed",
+            buildCache->getTocCount());
   }
   if (!tocParsed) {
-    LOG_DBG("EBP", "Warning: could not parse any TOC format during background build");
+    LOG_ERR("EBP", "TOC pass produced no parsed TOC (navAttempted=%d ncxAttempted=%d tocCount=%d)", navAttempted,
+            ncxAttempted, buildCache->getTocCount());
+  } else if (buildCache->getTocCount() == 0) {
+    LOG_ERR("EBP", "TOC parse returned ok but emitted 0 entries (navAttempted=%d ncxAttempted=%d)", navAttempted,
+            ncxAttempted);
   }
   if (!buildCache->endTocPass()) return false;
 

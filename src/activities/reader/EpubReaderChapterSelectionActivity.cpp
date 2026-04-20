@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Logging.h>
 
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
@@ -29,10 +30,20 @@ void EpubReaderChapterSelectionActivity::onEnter() {
   Activity::onEnter();
 
   if (!epub) {
+    LOG_ERR("EPUB_CHAP", "onEnter: epub is null");
     return;
   }
 
+  const int tocCount = epub->getTocItemsCount();
+  LOG_INF("EPUB_CHAP", "onEnter: epub=%p tocCount=%d currentSpineIndex=%d path='%s'", static_cast<void*>(epub.get()),
+          tocCount, currentSpineIndex, epub->getPath().c_str());
+  for (int i = 0; i < tocCount && i < 8; i++) {
+    const auto item = epub->getTocItem(i);
+    LOG_DBG("EPUB_CHAP", "  toc[%d]: level=%d title='%.40s'", i, item.level, item.title.c_str());
+  }
+
   selectorIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  LOG_DBG("EPUB_CHAP", "onEnter: getTocIndexForSpineIndex(%d) => %d", currentSpineIndex, selectorIndex);
   if (selectorIndex == -1) {
     selectorIndex = 0;
   }

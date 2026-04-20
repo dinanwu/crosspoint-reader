@@ -79,6 +79,11 @@ class SubscriptionSyncer {
     std::string etag;
     size_t size = 0;
     uint16_t chapterCount = 0;
+    // Range-download support. stablePrefixLength == 0 or contentHash empty
+    // means the server hasn't published the extension for this series and the
+    // device falls back to full downloads. See docs/subscription-sync-range.md.
+    uint32_t stablePrefixLength = 0;
+    std::string contentHash;
   };
 
   void transitionTo(Phase p);
@@ -88,6 +93,13 @@ class SubscriptionSyncer {
   void cleanupOrphans();
   void teardownWifi();
   void populateSeriesMeta(const SeriesEntry& series, const std::string& epubPath);
+  // Clears per-series stablePrefixLength/contentHash and deletes the associated
+  // EPUB for any series that left a stale .updating flag on disk from a prior
+  // crashed range write. Called once at sync start before any HTTP activity.
+  void sweepStaleUpdateFlags();
+  // SHA-256 the file at `path` and compare to `expectedHash` ("sha256:<hex>").
+  // Returns false on any I/O error, prefix mismatch, or digest mismatch.
+  bool verifyAssembledFile(const std::string& path, const std::string& expectedHash);
 
   Progress progress_;
   SubscriptionState state_;

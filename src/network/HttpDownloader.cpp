@@ -265,9 +265,11 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
 
 namespace {
 // Builds an HTTPS/HTTP client pair and applies standard headers + optional bearer auth +
-// optional If-None-Match. Caller owns the returned client via the out unique_ptr.
+// optional If-None-Match + optional Range. Caller owns the returned client via the out
+// unique_ptr.
 void applyConditionalHeaders(HTTPClient& http, std::unique_ptr<NetworkClient>& clientOut, const std::string& url,
-                             const std::string& bearerToken, const std::string& ifNoneMatch) {
+                             const std::string& bearerToken, const std::string& ifNoneMatch,
+                             size_t rangeStart = 0) {
   if (UrlUtils::isHttpsUrl(url)) {
     auto* secureClient = new NetworkClientSecure();
     secureClient->setInsecure();
@@ -285,8 +287,13 @@ void applyConditionalHeaders(HTTPClient& http, std::unique_ptr<NetworkClient>& c
   if (!ifNoneMatch.empty()) {
     http.addHeader("If-None-Match", ifNoneMatch.c_str());
   }
+  if (rangeStart > 0) {
+    char rangeHdr[48];
+    snprintf(rangeHdr, sizeof(rangeHdr), "bytes=%zu-", rangeStart);
+    http.addHeader("Range", rangeHdr);
+  }
 
-  static const char* kCollectedHeaders[] = {"ETag", "Last-Modified"};
+  static const char* kCollectedHeaders[] = {"ETag", "Last-Modified", "Content-Range"};
   http.collectHeaders(kCollectedHeaders, sizeof(kCollectedHeaders) / sizeof(kCollectedHeaders[0]));
 }
 
@@ -331,13 +338,13 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
                                                                      const std::string& destPath,
                                                                      const std::string& bearerToken,
                                                                      const std::string& ifNoneMatch,
-                                                                     ProgressCallback progress) {
+                                                                     size_t rangeStart, ProgressCallback progress) {
   std::unique_ptr<NetworkClient> client;
   HTTPClient http;
-  applyConditionalHeaders(http, client, url, bearerToken, ifNoneMatch);
+  applyConditionalHeaders(http, client, url, bearerToken, ifNoneMatch, rangeStart);
 
-  LOG_DBG("HTTP", "Conditional download: %s -> %s (etag=%s)", url.c_str(), destPath.c_str(),
-          ifNoneMatch.empty() ? "<none>" : ifNoneMatch.c_str());
+  LOG_DBG("HTTP", "Conditional download: %s -> %s (etag=%s range=%zu)", url.c_str(), destPath.c_str(),
+          ifNoneMatch.empty() ? "<none>" : ifNoneMatch.c_str(), rangeStart);
 
   const int httpCode = http.GET();
   HttpResult result = fillResult(http, httpCode);
@@ -348,26 +355,73 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
     return result;
   }
 
-  if (httpCode != HTTP_CODE_OK) {
+  const bool isPartial = (httpCode == HTTP_CODE_PARTIAL_CONTENT);
+  if (httpCode != HTTP_CODE_OK && !isPartial) {
     LOG_ERR("HTTP", "Conditional download failed: %d", httpCode);
     http.end();
     return result;
   }
 
+  // Parse Content-Range on 206 so we know exactly which byte range the server
+  // agreed to send. Reject any mismatch with what we asked for — silent drift
+  // here would corrupt the assembled file.
+  size_t writeStart = 0;
+  if (isPartial) {
+    const String crHdr = http.header("Content-Range");
+    size_t rangeEnd = 0;
+    size_t resourceSize = 0;
+    if (sscanf(crHdr.c_str(), "bytes %zu-%zu/%zu", &writeStart, &rangeEnd, &resourceSize) != 3) {
+      LOG_ERR("HTTP", "Malformed Content-Range: %s", crHdr.c_str());
+      http.end();
+      result.status = -1;
+      return result;
+    }
+    if (writeStart != rangeStart) {
+      LOG_ERR("HTTP", "Content-Range start mismatch: requested=%zu got=%zu", rangeStart, writeStart);
+      http.end();
+      result.status = -1;
+      return result;
+    }
+    result.rangeStart = writeStart;
+    result.rangeTotalSize = resourceSize;
+  }
+
   const int64_t reportedLength = http.getSize();
   const size_t contentLength = reportedLength > 0 ? static_cast<size_t>(reportedLength) : 0;
-  LOG_INF("HTTP", "Begin download: %zu bytes -> %s (free=%u minFree=%u maxAlloc=%u)", contentLength, destPath.c_str(),
-          static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
-          static_cast<unsigned>(ESP.getMaxAllocHeap()));
-
-  Storage.remove(destPath.c_str());
+  LOG_INF("HTTP", "Begin download: %zu bytes -> %s (range=%s start=%zu free=%u minFree=%u maxAlloc=%u)", contentLength,
+          destPath.c_str(), isPartial ? "yes" : "no", writeStart, static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<unsigned>(ESP.getMinFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
 
   FsFile file;
-  if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
-    LOG_ERR("HTTP", "Failed to open file for writing");
-    http.end();
-    result.status = -1;  // Signal file error distinct from HTTP status
-    return result;
+  if (isPartial) {
+    // In-place: open existing file for read+write (no truncate), seek to rangeStart.
+    // The caller holds a `.updating` flag so a crash here is recoverable on next sync.
+    file = Storage.open(destPath.c_str(), O_RDWR);
+    if (!file.isOpen()) {
+      LOG_ERR("HTTP", "Failed to open %s for in-place range write", destPath.c_str());
+      http.end();
+      result.status = -1;
+      return result;
+    }
+    if (!file.seekSet(writeStart)) {
+      LOG_ERR("HTTP", "Failed to seek to %zu in %s", writeStart, destPath.c_str());
+      file.close();
+      http.end();
+      result.status = -1;
+      return result;
+    }
+  } else {
+    // Full download: truncating open, same as before. Note this is also the path
+    // taken when the caller asked for a range but the server responded 200 — the
+    // caller detects that via HttpResult.rangeStart == 0 even though it passed a
+    // non-zero rangeStart in.
+    Storage.remove(destPath.c_str());
+    if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
+      LOG_ERR("HTTP", "Failed to open file for writing");
+      http.end();
+      result.status = -1;
+      return result;
+    }
   }
 
   const unsigned long downloadStartMs = millis();
@@ -375,31 +429,51 @@ HttpDownloader::HttpResult HttpDownloader::downloadToFileConditional(const std::
   const int writeResult = http.writeToStream(&fileStream);
   const unsigned long downloadElapsedMs = millis() - downloadStartMs;
 
+  const size_t downloaded = fileStream.downloaded();
+
+  // After a successful 206 write, trim any leftover bytes from the previous (longer) tail.
+  if (isPartial && writeResult >= 0 && fileStream.ok()) {
+    const uint64_t newLength = static_cast<uint64_t>(writeStart) + downloaded;
+    if (!file.truncate(newLength)) {
+      LOG_ERR("HTTP", "Failed to truncate %s to %llu after range write", destPath.c_str(),
+              static_cast<unsigned long long>(newLength));
+      file.close();
+      http.end();
+      result.status = -1;
+      return result;
+    }
+  }
+
   file.close();
   http.end();
 
   if (writeResult < 0 || !fileStream.ok()) {
     LOG_ERR("HTTP",
             "Stream write failed: writeResult=%d (%s) streamOk=%d aborted=%d "
-            "downloaded=%zu/%zu elapsed=%lums (free=%u maxAlloc=%u)",
+            "downloaded=%zu/%zu elapsed=%lums range=%s (free=%u maxAlloc=%u)",
             writeResult, httpErrorName(writeResult), fileStream.ok() ? 1 : 0, fileStream.aborted() ? 1 : 0,
-            fileStream.downloaded(), contentLength, downloadElapsedMs, static_cast<unsigned>(ESP.getFreeHeap()),
-            static_cast<unsigned>(ESP.getMaxAllocHeap()));
-    Storage.remove(destPath.c_str());
+            fileStream.downloaded(), contentLength, downloadElapsedMs, isPartial ? "yes" : "no",
+            static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    // For full downloads, remove the partially-written file. For range writes we
+    // leave the destination alone — the caller's `.updating` flag handles cleanup.
+    if (!isPartial) {
+      Storage.remove(destPath.c_str());
+    }
     result.status = -1;
     return result;
   }
 
-  const size_t downloaded = fileStream.downloaded();
   if (contentLength > 0 && downloaded != contentLength) {
     LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu (elapsed=%lums)", downloaded, contentLength,
             downloadElapsedMs);
-    Storage.remove(destPath.c_str());
+    if (!isPartial) {
+      Storage.remove(destPath.c_str());
+    }
     result.status = -1;
     return result;
   }
 
-  LOG_INF("HTTP", "Download complete: %zu bytes in %lums (free=%u)", downloaded, downloadElapsedMs,
-          static_cast<unsigned>(ESP.getFreeHeap()));
+  LOG_INF("HTTP", "Download complete: %zu bytes in %lums (free=%u range=%s)", downloaded, downloadElapsedMs,
+          static_cast<unsigned>(ESP.getFreeHeap()), isPartial ? "yes" : "no");
   return result;
 }

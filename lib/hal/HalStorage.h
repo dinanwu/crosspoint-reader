@@ -79,6 +79,9 @@ class HalFile : public Print {
   bool seek(size_t pos);
   bool seekCur(int64_t offset);
   bool seekSet(size_t offset);
+  // Shrink (or extend, filesystem-dependent) the file to the given length.
+  // Used by range downloads to lop off trailing bytes after an in-place update.
+  bool truncate(uint64_t length);
   int available() const;
   size_t position() const;
   int read(void* buf, size_t count);

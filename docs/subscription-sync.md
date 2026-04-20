@@ -82,10 +82,12 @@ Server needs valid TLS for TLS to complete; any cert works. Let's Encrypt is fin
       "title": "Sky Pride",
       "author": "Gravity Tales",
       "url": "/v1/subs/royalroad-107917.epub",
-      "etag": "W/\"abc123\"",
+      "etag": "\"abc123\"",
       "size": 2457600,
       "updatedAt": 1712956800,
-      "chapterCount": 42
+      "chapterCount": 42,
+      "stablePrefixLength": 2340192,
+      "contentHash": "sha256:9c1185a5c5e9fc54612808977ee8f548b2258d31"
     }
   ]
 }
@@ -106,6 +108,8 @@ Server needs valid TLS for TLS to complete; any cert works. Let's Encrypt is fin
 | `series[].size` | int (bytes) | For download progress bar. |
 | `series[].updatedAt` | unix seconds | Last time the EPUB was rebuilt. Advisory — not currently read by the device. |
 | `series[].chapterCount` | int | Current chapter count. Stored as `lastKnownSpineCount` so the inbox can show "N new chapters" without re-parsing the EPUB. When omitted (or `0`), the device falls back to parsing the downloaded EPUB — ~18 s for a 2 MB book on ESP32-C3. Servers SHOULD always send this. |
+| `series[].stablePrefixLength` | int (bytes) | Range-download support. Byte offset at which this build's chapter region ends and the regenerated region (OPF, nav, central directory) begins. Device sends `Range: bytes=<oldStablePrefixLength>-` to fetch only the new tail. Omit to disable range downloads for this series; the device then does a full re-download on every change. See [subscription-sync-range.md](./subscription-sync-range.md). |
+| `series[].contentHash` | string | SHA-256 of the full EPUB bytes, lowercase hex, prefixed `sha256:`. Used to verify locally-assembled files after a range update. Device rejects any other algorithm prefix. REQUIRED when `stablePrefixLength` is present. |
 
 `author` is consumed from the downloaded EPUB's OPF metadata, not from the index. `updatedAt` is reserved for future "updated X ago" display; servers SHOULD provide it for forward compatibility.
 
@@ -155,6 +159,18 @@ Both endpoints must set an `ETag` header on every response. Device sends `If-Non
 3. On `200`: device parses the new index, compares each `series[].etag` against locally stored per-series ETags.
 4. For each changed series: `GET /v1/subs/<id>.epub` with conditional `If-None-Match`. Download if server returns `200`.
 5. Device persists the new index ETag and per-series ETags after successful application.
+
+### Range downloads (optional)
+
+When the server publishes `stablePrefixLength` + `contentHash` for a series and the device already has a local EPUB from a prior sync, the per-series GET also sends `Range: bytes=<oldStablePrefixLength>-`. Server responses:
+
+- `304 Not Modified` — `If-None-Match` matched, no work. (Evaluated before `Range` per RFC 7232 §6.)
+- `206 Partial Content` — server sends just the new tail; device writes it in place on the existing `.epub` and truncates any trailing bytes.
+- `200 OK` — server declined the range (content changed in a way range can't satisfy); device falls back to a full rewrite of the file.
+
+After 200/206 the device verifies the full assembled file's SHA-256 against `contentHash` before committing state. On mismatch the local file is discarded and a full download is forced on the next sync.
+
+Crash resilience during in-place writes is handled by a `.updating` marker file swept at the start of each sync. Full protocol details live in [subscription-sync-range.md](./subscription-sync-range.md).
 
 ---
 

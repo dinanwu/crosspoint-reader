@@ -8,16 +8,19 @@
 #include <functional>
 
 namespace {
-// Bumped from 1 → 2 when seriesMeta was added. Older state files load in a
-// best-effort way: etags are preserved but seriesMeta stays empty until the
-// next successful download repopulates it.
-constexpr uint8_t STATE_FORMAT_VERSION = 2;
+// 1 → 2 when seriesMeta was added.
+// 2 → 3 when stablePrefixLength + contentHash were added for range downloads.
+// Older state files load in best-effort mode: missing fields default to
+// "unknown" (0 / empty) and repopulate on the next successful download.
+constexpr uint8_t STATE_FORMAT_VERSION = 3;
 
 void readSeriesMeta(JsonObjectConst entry, SubscriptionState::SeriesMeta& m) {
   m.title = entry["title"] | "";
   m.localPath = entry["localPath"] | "";
   m.lastSyncedMs = entry["lastSyncedMs"] | 0ULL;
   m.lastKnownSpineCount = entry["lastKnownSpineCount"] | 0;
+  m.stablePrefixLength = entry["stablePrefixLength"] | 0U;
+  m.contentHash = entry["contentHash"] | "";
 }
 
 void writeSeriesMeta(JsonObject entry, const SubscriptionState::SeriesMeta& m) {
@@ -25,6 +28,8 @@ void writeSeriesMeta(JsonObject entry, const SubscriptionState::SeriesMeta& m) {
   entry["localPath"] = m.localPath;
   entry["lastSyncedMs"] = m.lastSyncedMs;
   entry["lastKnownSpineCount"] = m.lastKnownSpineCount;
+  entry["stablePrefixLength"] = m.stablePrefixLength;
+  entry["contentHash"] = m.contentHash;
 }
 }  // namespace
 
@@ -40,6 +45,10 @@ std::string SubscriptionState::epubPathForId(const std::string& seriesId) {
 
 std::string SubscriptionState::partPathForId(const std::string& seriesId) {
   return epubPathForId(seriesId) + ".part";
+}
+
+std::string SubscriptionState::updatingFlagPathForId(const std::string& seriesId) {
+  return std::string(SUBSCRIPTIONS_DIR) + "/" + seriesId + ".updating";
 }
 
 std::string SubscriptionState::cachePathForEpub(const std::string& epubPath) {
@@ -106,7 +115,7 @@ bool SubscriptionState::load() {
   }
 
   const uint8_t version = doc["formatVersion"] | 0;
-  if (version != 1 && version != STATE_FORMAT_VERSION) {
+  if (version < 1 || version > STATE_FORMAT_VERSION) {
     LOG_ERR("SUB", "Unsupported state format version: %u", version);
     return false;
   }

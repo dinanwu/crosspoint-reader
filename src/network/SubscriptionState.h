@@ -22,6 +22,14 @@ class SubscriptionState {
     std::string localPath;
     uint64_t lastSyncedMs = 0;
     uint16_t lastKnownSpineCount = 0;
+    // Byte offset up to which chapter bytes in the EPUB are stable across
+    // server rebuilds. 0 means "server doesn't publish this / unknown" and
+    // forces the full-download path. See docs/subscription-sync-range.md.
+    uint32_t stablePrefixLength = 0;
+    // SHA-256 of the full EPUB file bytes, stored as "sha256:<hex>". Used to
+    // verify assembled files after a range update. Empty means unavailable
+    // and suppresses range downloads for this series.
+    std::string contentHash;
   };
 
   std::string indexEtag;
@@ -41,6 +49,11 @@ class SubscriptionState {
 
   static std::string epubPathForId(const std::string& seriesId);
   static std::string partPathForId(const std::string& seriesId);
+  // Marker file dropped on disk while a range update is in flight. Presence at
+  // the start of a sync indicates the previous range write was interrupted;
+  // the series's stablePrefixLength is cleared and the EPUB is re-downloaded
+  // in full.
+  static std::string updatingFlagPathForId(const std::string& seriesId);
 
   // Returns the watermark spine count stored alongside an EPUB's cache dir.
   // Returns 0 if the sidecar file is missing (never-opened book).

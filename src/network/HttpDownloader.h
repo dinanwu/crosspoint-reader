@@ -43,10 +43,15 @@ class HttpDownloader {
                                       ProgressCallback progress = nullptr);
 
   // Response metadata returned by conditional-GET helpers. `status` carries the HTTP code
-  // (0 or negative on transport failure; 200/304 are the expected success codes).
+  // (0 or negative on transport failure; 200/206/304 are the expected success codes).
+  // When the caller requests a byte range and the server honors it with 206, rangeStart
+  // and rangeTotalSize echo back the parsed Content-Range header so the caller knows
+  // the file was updated in place instead of fully rewritten.
   struct HttpResult {
     int status = 0;
     std::string etag;
+    size_t rangeStart = 0;      // First byte written. 0 on 200 or 304.
+    size_t rangeTotalSize = 0;  // Full-resource size from Content-Range. 0 on 200 or 304.
   };
 
   /**
@@ -60,15 +65,23 @@ class HttpDownloader {
                                      const std::string& ifNoneMatch);
 
   /**
-   * Conditional GET that streams a 200 response body to a file. On 304 or error the file
-   * is not created (or is removed if partially written).
+   * Conditional GET that streams a 200 or 206 response body to a file. On 304 or error
+   * the file is not created (or is removed if partially written on a full download).
+   *
+   * When `rangeStart > 0` the request includes `Range: bytes=<rangeStart>-`. If the
+   * server honors it with `206 Partial Content`, `destPath` MUST already exist and is
+   * modified in place: bytes at `[rangeStart, EOF)` are overwritten and the file is
+   * truncated to the new end. If the server declines and replies `200 OK`, the file
+   * is rewritten from scratch (full-download fallback) and `HttpResult.rangeStart` is 0.
+   *
    * @param url The URL to download
    * @param destPath Destination path on SD
    * @param bearerToken If non-empty, sent as Authorization: Bearer <token>
    * @param ifNoneMatch If non-empty, sent as If-None-Match: <etag>
+   * @param rangeStart If > 0, sent as Range: bytes=<rangeStart>-; 206 handled in place
    * @param progress Optional progress callback
    */
   static HttpResult downloadToFileConditional(const std::string& url, const std::string& destPath,
                                               const std::string& bearerToken, const std::string& ifNoneMatch,
-                                              ProgressCallback progress = nullptr);
+                                              size_t rangeStart = 0, ProgressCallback progress = nullptr);
 };

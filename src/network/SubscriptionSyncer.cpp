@@ -8,6 +8,9 @@
 #include <WiFi.h>
 #include <esp_sntp.h>
 
+#include <mbedtls/sha256.h>
+
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <unordered_set>
@@ -90,6 +93,10 @@ bool SubscriptionSyncer::begin() {
   // State::save() mkdir's, but it only runs after a successful download — the
   // first-ever sync would otherwise fail to open its .part file.
   Storage.mkdir(SubscriptionState::SUBSCRIPTIONS_DIR);
+
+  // Recover any series caught mid-range-write by a prior crash: clear their
+  // range-extension state so the upcoming sync falls through to the full path.
+  sweepStaleUpdateFlags();
   return true;
 }
 
@@ -270,6 +277,8 @@ bool SubscriptionSyncer::fetchAndParseIndex() {
       e.etag = entry["etag"] | "";
       e.size = entry["size"] | 0;
       e.chapterCount = entry["chapterCount"] | 0;
+      e.stablePrefixLength = entry["stablePrefixLength"] | 0U;
+      e.contentHash = entry["contentHash"] | "";
       if (e.id.empty() || e.url.empty()) {
         LOG_DBG("SUB", "Skipping index entry with missing id or url");
         continue;
@@ -299,6 +308,7 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
   const std::string url = UrlUtils::buildUrl(serverUrl_, series.url);
   const std::string destPath = SubscriptionState::epubPathForId(series.id);
   const std::string partPath = SubscriptionState::partPathForId(series.id);
+  const std::string flagPath = SubscriptionState::updatingFlagPathForId(series.id);
 
   auto it = state_.seriesEtags.find(series.id);
   if (!series.etag.empty() && it != state_.seriesEtags.end() && it->second == series.etag &&
@@ -315,8 +325,12 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
 
   const std::string ifNoneMatch = (it != state_.seriesEtags.end()) ? it->second : std::string();
 
-  LOG_INF("SUB", "Downloading series '%s' (%zu bytes expected) url=%s ifNoneMatch=%s", series.id.c_str(), series.size,
-          url.c_str(), ifNoneMatch.empty() ? "<none>" : ifNoneMatch.c_str());
+  // Decide range vs full strategy. Range requires a stable prefix handshake
+  // (server published both fields, the prefix didn't shrink, local EPUB exists).
+  auto metaIt = state_.seriesMeta.find(series.id);
+  const uint32_t oldStablePrefix = (metaIt != state_.seriesMeta.end()) ? metaIt->second.stablePrefixLength : 0U;
+  const bool useRange = oldStablePrefix > 0 && series.stablePrefixLength >= oldStablePrefix &&
+                        !series.contentHash.empty() && Storage.exists(destPath.c_str());
 
   auto progressCb = [this, total = series.size](size_t downloaded, size_t reportedTotal) -> bool {
     progress_.bytesDone = downloaded;
@@ -325,7 +339,93 @@ bool SubscriptionSyncer::downloadCurrentSeries() {
     return !abortRequested_;
   };
 
-  const auto result = HttpDownloader::downloadToFileConditional(url, partPath, bearerToken_, ifNoneMatch, progressCb);
+  if (useRange) {
+    LOG_INF("SUB", "Range download '%s' start=%u new=%u url=%s", series.id.c_str(),
+            static_cast<unsigned>(oldStablePrefix), static_cast<unsigned>(series.stablePrefixLength), url.c_str());
+
+    // Drop the .updating marker before the first in-place write. Next sync's
+    // sweep uses it to detect a crashed range update.
+    Storage.writeFile(flagPath.c_str(), String());
+
+    // Invalidate book.bin up front so the reader never opens a half-updated
+    // EPUB alongside a stale spine cache.
+    const std::string cachePath = SubscriptionState::cachePathForEpub(destPath);
+    Storage.remove((cachePath + "/book.bin").c_str());
+
+    const auto result = HttpDownloader::downloadToFileConditional(url, destPath, bearerToken_, ifNoneMatch,
+                                                                  oldStablePrefix, progressCb);
+
+    if (result.status == 304) {
+      LOG_DBG("SUB", "Series '%s' 304 Not Modified (range path)", series.id.c_str());
+      Storage.remove(flagPath.c_str());
+      return true;
+    }
+
+    if (result.status == 404) {
+      LOG_DBG("SUB", "Series '%s' 404, skipping", series.id.c_str());
+      Storage.remove(flagPath.c_str());
+      return true;
+    }
+
+    if (result.status == 401) {
+      LOG_ERR("SUB", "Series '%s' 401 Unauthorized", series.id.c_str());
+      progress_.failure = FailureReason::Unauthorized;
+      Storage.remove(flagPath.c_str());
+      return false;
+    }
+
+    if (result.status != 200 && result.status != 206) {
+      if (abortRequested_) {
+        LOG_DBG("SUB", "Series '%s' download aborted by user", series.id.c_str());
+        Storage.remove(flagPath.c_str());
+        return false;
+      }
+      LOG_ERR("SUB", "Series '%s' range download failed: %d", series.id.c_str(), result.status);
+      progress_.failure = FailureReason::ServerError;
+      Storage.remove(flagPath.c_str());
+      return false;
+    }
+
+    // The file at destPath is now the full current-build EPUB (206 patched it
+    // in place, 200 rewrote it from scratch via HttpDownloader's fallback).
+    // Verify before committing state.
+    if (!verifyAssembledFile(destPath, series.contentHash)) {
+      LOG_ERR("SUB", "Series '%s' hash mismatch after %s; forcing full re-download next sync", series.id.c_str(),
+              result.rangeStart > 0 ? "range" : "full-fallback");
+      Storage.remove(destPath.c_str());
+      if (metaIt != state_.seriesMeta.end()) {
+        metaIt->second.stablePrefixLength = 0;
+        metaIt->second.contentHash.clear();
+      }
+      state_.seriesEtags.erase(series.id);
+      state_.save();
+      Storage.remove(flagPath.c_str());
+      // Soft failure: don't abort the whole sync, and the file is gone so
+      // next sync sees no local .epub and does a full download.
+      return true;
+    }
+
+    if (!SubscriptionState::isSubscription(destPath)) {
+      SubscriptionState::writeWatermark(destPath, 0);
+    }
+
+    state_.seriesEtags[series.id] = result.etag;
+    populateSeriesMeta(series, destPath);
+    state_.save();
+    Storage.remove(flagPath.c_str());
+
+    progress_.anyChanges = true;
+    LOG_INF("SUB", "Series '%s' %s (%zu bytes)", series.id.c_str(),
+            result.rangeStart > 0 ? "range-updated" : "re-downloaded", progress_.bytesDone);
+    return true;
+  }
+
+  // Full-download path: .part staging + atomic rename, unchanged.
+  LOG_INF("SUB", "Downloading series '%s' (%zu bytes expected) url=%s ifNoneMatch=%s", series.id.c_str(), series.size,
+          url.c_str(), ifNoneMatch.empty() ? "<none>" : ifNoneMatch.c_str());
+
+  const auto result =
+      HttpDownloader::downloadToFileConditional(url, partPath, bearerToken_, ifNoneMatch, 0, progressCb);
 
   if (result.status == 304) {
     LOG_DBG("SUB", "Series '%s' 304 Not Modified", series.id.c_str());
@@ -413,7 +513,98 @@ void SubscriptionSyncer::populateSeriesMeta(const SeriesEntry& series, const std
     m.lastKnownSpineCount = static_cast<uint16_t>(epub.getSpineItemsCount());
   }
 
+  m.stablePrefixLength = series.stablePrefixLength;
+  m.contentHash = series.contentHash;
+
   state_.seriesMeta[series.id] = std::move(m);
+}
+
+void SubscriptionSyncer::sweepStaleUpdateFlags() {
+  // A .updating flag means we crashed (or were cancelled) mid-range-write: the
+  // local EPUB's tail may be a mix of old and new bytes. Clear both the flag
+  // and the range-extension state so the next download for that series takes
+  // the full path and writes a clean file.
+  std::unordered_set<std::string> allIds;
+  for (const auto& kv : state_.seriesMeta) allIds.insert(kv.first);
+  for (const auto& kv : state_.seriesEtags) allIds.insert(kv.first);
+
+  bool anySwept = false;
+  for (const std::string& id : allIds) {
+    const std::string flagPath = SubscriptionState::updatingFlagPathForId(id);
+    if (!Storage.exists(flagPath.c_str())) continue;
+
+    LOG_INF("SUB", "Stale .updating flag for '%s'; forcing full re-download", id.c_str());
+    const std::string epubPath = SubscriptionState::epubPathForId(id);
+    Storage.remove(epubPath.c_str());
+    auto metaIt = state_.seriesMeta.find(id);
+    if (metaIt != state_.seriesMeta.end()) {
+      metaIt->second.stablePrefixLength = 0;
+      metaIt->second.contentHash.clear();
+    }
+    state_.seriesEtags.erase(id);
+    Storage.remove(flagPath.c_str());
+    anySwept = true;
+  }
+
+  if (anySwept) {
+    state_.save();
+  }
+}
+
+bool SubscriptionSyncer::verifyAssembledFile(const std::string& path, const std::string& expectedHash) {
+  // Contract (docs/subscription-sync-range.md) locks contentHash to "sha256:<hex>".
+  // Reject any other prefix rather than silently treating it as opaque.
+  static constexpr char kPrefix[] = "sha256:";
+  static constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+  if (expectedHash.size() <= kPrefixLen || expectedHash.compare(0, kPrefixLen, kPrefix) != 0) {
+    LOG_ERR("SUB", "Unsupported contentHash algorithm: %s", expectedHash.c_str());
+    return false;
+  }
+  const std::string expectedHex = expectedHash.substr(kPrefixLen);
+
+  FsFile file;
+  if (!Storage.openFileForRead("SUB", path.c_str(), file)) {
+    LOG_ERR("SUB", "Hash check: cannot open %s", path.c_str());
+    return false;
+  }
+
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  if (mbedtls_sha256_starts(&ctx, 0) != 0) {
+    mbedtls_sha256_free(&ctx);
+    file.close();
+    return false;
+  }
+
+  // 512-byte buffer balances throughput and stack cost (~100 B context + 512 B
+  // buffer fits well inside the 4 KB SubSync task stack).
+  uint8_t buf[512];
+  int n;
+  while ((n = file.read(buf, sizeof(buf))) > 0) {
+    if (mbedtls_sha256_update(&ctx, buf, static_cast<size_t>(n)) != 0) {
+      mbedtls_sha256_free(&ctx);
+      file.close();
+      return false;
+    }
+  }
+  file.close();
+
+  uint8_t digest[32];
+  if (mbedtls_sha256_finish(&ctx, digest) != 0) {
+    mbedtls_sha256_free(&ctx);
+    return false;
+  }
+  mbedtls_sha256_free(&ctx);
+
+  char hex[65];
+  for (int i = 0; i < 32; ++i) {
+    snprintf(hex + i * 2, 3, "%02x", digest[i]);
+  }
+  const bool match = expectedHex == hex;
+  if (!match) {
+    LOG_ERR("SUB", "Hash mismatch for %s: expected=%s got=%s", path.c_str(), expectedHex.c_str(), hex);
+  }
+  return match;
 }
 
 void SubscriptionSyncer::cleanupOrphans() {
