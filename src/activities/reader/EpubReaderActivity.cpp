@@ -10,6 +10,8 @@
 #include <Logging.h>
 #include <esp_system.h>
 
+#include <algorithm>
+
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderChapterSelectionActivity.h"
@@ -77,10 +79,20 @@ void EpubReaderActivity::onEnter() {
   // at book end depends on this signal being fresh per-open — reset before probing.
   isSubscription = false;
   watermarkSpineCount = 0;
+  lastKnownSpineCountAtOpen = 0;
   isSubscription = SubscriptionState::tryReadWatermark(epub->getPath(), watermarkSpineCount);
   if (isSubscription) {
-    LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d", watermarkSpineCount,
-            epub->getSpineItemsCount());
+    // Capture the server-reported spine count at open time so auto-advance can
+    // detect if the series grew during this reading session (mid-session sync).
+    SubscriptionState state;
+    if (state.load()) {
+      const std::string id = state.findIdByLocalPath(epub->getPath());
+      if (!id.empty()) {
+        lastKnownSpineCountAtOpen = state.seriesMeta[id].lastKnownSpineCount;
+      }
+    }
+    LOG_DBG("ERS", "Subscription detected, watermark=%u, spineCount=%d, lastKnown=%u", watermarkSpineCount,
+            epub->getSpineItemsCount(), lastKnownSpineCountAtOpen);
   }
   // We may want a better condition to detect if we are opening for the first time.
   // This will trigger if the book is re-opened at Chapter 0.
@@ -107,26 +119,40 @@ void EpubReaderActivity::onExit() {
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
-  // Re-arm the subscription watermark to the server-reported spine count — the
-  // same number the inbox subtracts against. Raw OPF spine count drifts whenever
-  // chapterCount != getSpineItemsCount() (cover/nav items), which would
-  // permanently zero the unread badge after a single open.
+  // Re-arm the subscription watermark to the user's current reading position, so
+  // the inbox shows "chapters past where I've read" (honest unread count), not
+  // "chapters added since last open" (which would zero on any brief open).
+  //
+  // Watermark lives in chapter-count space (same as lastKnownSpineCount) so the
+  // inbox's subtraction is well-defined. The OPF spine can include cover/nav
+  // items the server doesn't count as chapters — compensate by subtracting the
+  // preamble size (spineCount - lastKnown) from the current spine position.
   if (isSubscription && epub) {
-    uint16_t newWatermark = 0;
+    const int spineCount = epub->getSpineItemsCount();
+    uint16_t lastKnown = 0;
     SubscriptionState state;
     if (state.load()) {
       const std::string id = state.findIdByLocalPath(epub->getPath());
       if (!id.empty()) {
-        newWatermark = state.seriesMeta[id].lastKnownSpineCount;
+        lastKnown = state.seriesMeta[id].lastKnownSpineCount;
       }
     }
-    if (newWatermark == 0) {
-      newWatermark = static_cast<uint16_t>(epub->getSpineItemsCount());
+
+    uint16_t newWatermark;
+    if (lastKnown == 0) {
+      // No server metadata — write raw spine position, clamped.
+      newWatermark = static_cast<uint16_t>(std::max(0, std::min(currentSpineIndex, spineCount)));
+    } else {
+      const int preamble = std::max(0, spineCount - static_cast<int>(lastKnown));
+      const int readChapters = std::max(0, currentSpineIndex - preamble);
+      newWatermark = static_cast<uint16_t>(std::min(readChapters, static_cast<int>(lastKnown)));
     }
+
     if (newWatermark == watermarkSpineCount) {
       LOG_DBG("ERS", "Watermark unchanged (%u), skipping write", newWatermark);
     } else if (SubscriptionState::writeWatermark(epub->getPath(), newWatermark)) {
-      LOG_DBG("ERS", "Watermark rewritten to %u", newWatermark);
+      LOG_DBG("ERS", "Watermark rewritten to %u (read spine %d of %d, lastKnown=%u)", newWatermark, currentSpineIndex,
+              spineCount, lastKnown);
     } else {
       LOG_ERR("ERS", "Failed to write watermark for %s", epub->getPath().c_str());
     }
@@ -941,14 +967,34 @@ bool EpubReaderActivity::tryAutoAdvanceToNextSubscription() {
   SubscriptionState state;
   if (!state.load()) return false;
 
-  const auto candidates = state.unreadSeriesIds(state.findIdByLocalPath(epub->getPath()));
+  const std::string currentId = state.findIdByLocalPath(epub->getPath());
+
+  // If the current series gained chapters mid-session, prefer reloading this
+  // book over hopping to a different series — the in-memory Epub still reflects
+  // the pre-sync spine. Reloading re-parses the EPUB on disk; saving progress
+  // at the past-the-end sentinel first makes the new reader land directly on
+  // the first new chapter (old spine count = first new chapter's spine index).
+  if (!currentId.empty()) {
+    const auto currentMeta = state.seriesMeta.find(currentId);
+    if (currentMeta != state.seriesMeta.end() &&
+        currentMeta->second.lastKnownSpineCount > lastKnownSpineCountAtOpen) {
+      LOG_DBG("ERS", "Current series grew since open (%u -> %u), reloading instead of advancing",
+              lastKnownSpineCountAtOpen, currentMeta->second.lastKnownSpineCount);
+      currentSpineIndex = epub->getSpineItemsCount();
+      saveProgress(currentSpineIndex, 0, 0);
+      activityManager.goToReader(currentMeta->second.localPath);
+      return true;
+    }
+  }
+
+  const auto candidates = state.unreadSeriesIds(currentId);
   if (candidates.empty()) return false;
 
-  auto it = state.seriesMeta.find(candidates.front());
-  if (it == state.seriesMeta.end() || it->second.localPath.empty()) return false;
+  const auto nextMeta = state.seriesMeta.find(candidates.front());
+  if (nextMeta == state.seriesMeta.end() || nextMeta->second.localPath.empty()) return false;
 
-  LOG_DBG("ERS", "Auto-advancing to next subscription: %s", it->second.localPath.c_str());
-  activityManager.goToReader(it->second.localPath);
+  LOG_DBG("ERS", "Auto-advancing to next subscription: %s", nextMeta->second.localPath.c_str());
+  activityManager.goToReader(nextMeta->second.localPath);
   return true;
 }
 

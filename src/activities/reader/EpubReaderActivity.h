@@ -29,10 +29,14 @@ class EpubReaderActivity final : public Activity {
   bool automaticPageTurnActive = false;
 
   // Subscription series marker. Detected by the presence of sub_watermark.bin next
-  // to progress.bin. The watermark is rewritten on onExit to the current spine count
-  // so the inbox can compute an unread-chapter badge on next sync.
+  // to progress.bin. The watermark is rewritten on onExit to the user's current
+  // reading position (in chapter-count space) so the inbox shows honest "unread
+  // chapters," not "chapters added since last open."
   bool isSubscription = false;
   uint16_t watermarkSpineCount = 0;
+  // lastKnownSpineCount captured at onEnter, used by auto-advance to detect when
+  // the current series grew during this reading session (mid-session sync).
+  uint16_t lastKnownSpineCountAtOpen = 0;
 
   // Deferred until after the first successful page render so the background
   // OPF/TOC parse doesn't compete with section-0 rendering for heap (see

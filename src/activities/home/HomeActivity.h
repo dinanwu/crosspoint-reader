@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "../Activity.h"
@@ -20,6 +21,9 @@ class HomeActivity final : public Activity {
   bool coverBufferStored = false;  // Track if cover buffer is stored
   uint8_t* coverBuffer = nullptr;  // HomeActivity's own buffer for cover image
   std::vector<RecentBook> recentBooks;
+  // Preformatted "Subscriptions" label (with "+N" suffix when there are unread
+  // chapters). Computed once in onEnter so the render path doesn't touch SD.
+  std::string subscriptionsLabel;
   void onSelectBook(const std::string& path);
   void onFileBrowserOpen();
   void onRecentsOpen();

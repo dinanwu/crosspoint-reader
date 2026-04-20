@@ -19,6 +19,7 @@
 #include "SubscriptionsInboxActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/SubscriptionState.h"
 
 int HomeActivity::getMenuItemCount() const {
   int count = 5;  // File Browser, Recents, Subscriptions, File transfer, Settings
@@ -118,6 +119,30 @@ void HomeActivity::onEnter() {
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   loadRecentBooks(metrics.homeRecentBooksCount);
+
+  // Sum unread chapters across all subscriptions so the Home menu row shows a
+  // glanceable "+N" — users shouldn't have to open the inbox to learn whether
+  // anything's new. Computed once here; the inbox refreshes on its own on re-entry.
+  subscriptionsLabel = tr(STR_SUBSCRIPTIONS);
+  if (SETTINGS.subscriptionsEnabled) {
+    SubscriptionState subState;
+    if (subState.load()) {
+      uint32_t totalUnread = 0;
+      for (const auto& kv : subState.seriesMeta) {
+        if (kv.second.localPath.empty()) continue;
+        const uint16_t watermark = SubscriptionState::readWatermark(kv.second.localPath);
+        if (kv.second.lastKnownSpineCount > watermark) {
+          totalUnread += kv.second.lastKnownSpineCount - watermark;
+        }
+      }
+      if (totalUnread > 0) {
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), tr(STR_INBOX_UNREAD_COUNT), static_cast<unsigned>(totalUnread));
+        subscriptionsLabel += ' ';
+        subscriptionsLabel += suffix;
+      }
+    }
+  }
 
   // Trigger first update
   requestUpdate();
@@ -239,7 +264,7 @@ void HomeActivity::render(RenderLock&&) {
     menuIcons.insert(menuIcons.begin() + insertPos, Library);
     insertPos++;
   }
-  menuItems.insert(menuItems.begin() + insertPos, tr(STR_SUBSCRIPTIONS));
+  menuItems.insert(menuItems.begin() + insertPos, subscriptionsLabel.c_str());
   menuIcons.insert(menuIcons.begin() + insertPos, Library);
   insertPos++;
 
